@@ -93,6 +93,7 @@ pub async fn spawn_process(request: SpawnRequest<'_>) -> Result<SpawnedProcess> 
                     tty: request.tty,
                     stdin_open: request.stdin_open,
                     use_private_desktop: windows.use_private_desktop,
+                    preserve_descendants_on_root_exit: true,
                 },
             )
             .await

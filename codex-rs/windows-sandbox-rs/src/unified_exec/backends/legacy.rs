@@ -325,6 +325,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    preserve_descendants_on_root_exit: bool,
 ) -> Result<SpawnedProcess> {
     let common = prepare_legacy_spawn_context(
         permission_profile,
@@ -433,11 +434,15 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
         if wait_res == WAIT_TIMEOUT {
             terminate_job_or_process(&job_for_wait, &wait_handle, wait_logs_base_dir.as_deref());
-        } else if let Err(err) = job_for_wait.preserve_descendants() {
-            log_note(
-                &format!("legacy spawn failed to preserve descendants after root exit: {err}"),
-                wait_logs_base_dir.as_deref(),
-            );
+        } else if preserve_descendants_on_root_exit {
+            if let Err(err) = job_for_wait.preserve_descendants() {
+                log_note(
+                    &format!("legacy spawn failed to preserve descendants after root exit: {err}"),
+                    wait_logs_base_dir.as_deref(),
+                );
+            }
+        } else {
+            terminate_job_or_process(&job_for_wait, &wait_handle, wait_logs_base_dir.as_deref());
         }
         if let Some(hpc) = hpc_for_wait
             && let Ok(mut guard) = hpc.lock()

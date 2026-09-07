@@ -1,5 +1,6 @@
-use crate::install_wfp_filters_for_account;
+use crate::installation::SandboxInstallationIdentity;
 use crate::setup_error::sanitize_setup_metric_tag_value;
+use crate::wfp::install_wfp_filters_for_installation;
 use anyhow::Result;
 use codex_otel::OtelExporter;
 use codex_otel::OtelProvider;
@@ -125,6 +126,7 @@ fn emit_wfp_setup_metric_safely<F>(
 
 pub fn install_wfp_filters<F>(
     codex_home: &Path,
+    identity: &SandboxInstallationIdentity,
     offline_username: &str,
     otel: Option<&StatsigMetricsSettings>,
     mut log: F,
@@ -132,7 +134,7 @@ pub fn install_wfp_filters<F>(
     F: FnMut(&str),
 {
     let metric = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        install_wfp_filters_for_account(offline_username)
+        install_wfp_filters_for_installation(codex_home, identity, offline_username)
     })) {
         Ok(Ok(installed_filter_count)) => {
             log(&format!(

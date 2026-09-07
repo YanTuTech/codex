@@ -46,7 +46,7 @@ use windows_sys::Win32::Security::CheckTokenMembership;
 use windows_sys::Win32::Security::FreeSid;
 use windows_sys::Win32::Security::SECURITY_NT_AUTHORITY;
 
-pub const SETUP_VERSION: u32 = 5;
+pub const SETUP_VERSION: u32 = 6;
 pub const OFFLINE_USERNAME: &str = "CodexSandboxOffline";
 pub const ONLINE_USERNAME: &str = "CodexSandboxOnline";
 const ERROR_CANCELLED: u32 = 1223;
@@ -332,10 +332,16 @@ fn run_setup_refresh_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+    let identity = crate::installation::load_or_create_installation_identity(&sandbox_dir(
+        request.codex_home,
+    ))?;
+    identity.validate_derived_account_names()?;
     let payload = ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        install_id: identity.install_id_hex(),
+        offline_username: identity.offline_username(),
+        online_username: identity.online_username(),
+        sandbox_group: identity.sandbox_group_name(),
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.command_cwd.to_path_buf(),
         read_roots,
@@ -421,6 +427,11 @@ pub struct SetupMarker {
     pub version: u32,
     pub offline_username: String,
     pub online_username: String,
+    /// Installation identity that owns this setup state. `None` only for
+    /// markers written before installation scoping; they fail
+    /// `request_mismatch_reason` and are re-provisioned.
+    #[serde(default)]
+    pub install_id: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
     #[serde(default)]
@@ -445,7 +456,16 @@ impl SetupMarker {
         &self,
         network_identity: SandboxNetworkIdentity,
         offline_proxy_settings: &OfflineProxySettings,
+        expected_install_id: Option<&str>,
     ) -> Option<String> {
+        match (&self.install_id, expected_install_id) {
+            (Some(marker_id), Some(expected_id)) if marker_id == expected_id => {}
+            _ => {
+                return Some(
+                    "sandbox installation identity changed; re-provisioning required".to_string(),
+                );
+            }
+        }
         if !network_identity.uses_offline_identity() {
             return None;
         }
@@ -669,8 +689,13 @@ pub(crate) fn effective_write_roots_for_permissions(
 #[derive(Serialize)]
 struct ElevationPayload {
     version: u32,
+    /// Installation identity (lowercase hex) anchoring every derived
+    /// resource name. The helper re-derives and verifies the account and
+    /// group names below against this identity and rejects mismatches.
+    install_id: String,
     offline_username: String,
     online_username: String,
+    sandbox_group: String,
     codex_home: PathBuf,
     command_cwd: PathBuf,
     read_roots: Vec<PathBuf>,
@@ -694,6 +719,10 @@ struct ElevationPayload {
 enum SetupMode {
     Full,
     ProvisionOnly,
+    /// Removes exactly the resources owned by the payload's installation
+    /// identity: derived firewall rules, WFP objects, group ACEs on recorded
+    /// roots, the sandbox accounts/group, and the sandbox state files.
+    Uninstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1018,6 +1047,19 @@ fn run_setup_exe_payload(
     Ok(())
 }
 
+/// Reads the sandbox account names recorded by the last committed setup for
+/// `codex_home`. Account names are installation-derived, so callers (like the
+/// doctor check) must read them from the marker instead of assuming the
+/// Codex-global constants.
+pub fn sandbox_setup_account_names(codex_home: &Path) -> Option<(String, String)> {
+    let contents = std::fs::read_to_string(setup_marker_path(codex_home)).ok()?;
+    let marker: SetupMarker = serde_json::from_str(&contents).ok()?;
+    if !marker.version_matches() {
+        return None;
+    }
+    Some((marker.offline_username, marker.online_username))
+}
+
 pub fn run_elevated_setup(
     request: SandboxSetupRequest<'_>,
     overrides: SetupRootOverrides,
@@ -1056,10 +1098,14 @@ fn run_elevated_setup_inner(
     let deny_write_paths = build_payload_deny_write_paths(&request, overrides.deny_write_paths);
     let offline_proxy_settings =
         offline_proxy_settings_for_request(&request, offline_proxy_settings_override);
+    let identity = crate::installation::load_or_create_installation_identity(&sbx_dir)?;
+    identity.validate_derived_account_names()?;
     let payload = ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        install_id: identity.install_id_hex(),
+        offline_username: identity.offline_username(),
+        online_username: identity.online_username(),
+        sandbox_group: identity.sandbox_group_name(),
         codex_home: request.codex_home.to_path_buf(),
         command_cwd: request.command_cwd.to_path_buf(),
         read_roots,
@@ -1123,10 +1169,14 @@ pub fn run_elevated_provisioning_setup(
             "sandbox provisioning setup must be run from an elevated process",
         ));
     }
+    let identity = crate::installation::load_or_create_installation_identity(&sbx_dir)?;
+    identity.validate_derived_account_names()?;
     let payload = ElevationPayload {
         version: SETUP_VERSION,
-        offline_username: OFFLINE_USERNAME.to_string(),
-        online_username: ONLINE_USERNAME.to_string(),
+        install_id: identity.install_id_hex(),
+        offline_username: identity.offline_username(),
+        online_username: identity.online_username(),
+        sandbox_group: identity.sandbox_group_name(),
         codex_home: codex_home.to_path_buf(),
         command_cwd: codex_home.to_path_buf(),
         read_roots: Vec::new(),
@@ -1141,6 +1191,51 @@ pub fn run_elevated_provisioning_setup(
         refresh_only: false,
     };
     run_setup_exe(&payload, /*needs_elevation*/ false, codex_home)
+}
+
+/// Runs the elevated uninstall for the installation identity persisted in
+/// `codex_home`. Removes only resources owned by that exact identity:
+/// derived firewall rules, WFP objects, sandbox-group ACEs on recorded
+/// roots, the two sandbox accounts and their group, and the sandbox state
+/// files. Never touches resources owned by any other Codex or LeapSea
+/// installation, and never restores a wholesale ACL snapshot.
+pub fn run_elevated_uninstall(codex_home: &Path, real_user: &str) -> Result<()> {
+    let sbx_dir = sandbox_dir(codex_home);
+    let identity = match crate::installation::read_installation_identity(&sbx_dir)? {
+        Some(identity) => identity,
+        None => {
+            return Err(failure(
+                SetupErrorCode::OrchestratorElevationRequired,
+                "sandbox uninstall requires an existing installation identity",
+            ));
+        }
+    };
+    let payload = ElevationPayload {
+        version: SETUP_VERSION,
+        install_id: identity.install_id_hex(),
+        offline_username: identity.offline_username(),
+        online_username: identity.online_username(),
+        sandbox_group: identity.sandbox_group_name(),
+        codex_home: codex_home.to_path_buf(),
+        command_cwd: codex_home.to_path_buf(),
+        read_roots: Vec::new(),
+        write_roots: Vec::new(),
+        deny_read_paths: Vec::new(),
+        deny_write_paths: Vec::new(),
+        proxy_ports: Vec::new(),
+        allow_local_binding: false,
+        otel: codex_otel::global_statsig_metrics_settings(),
+        real_user: real_user.to_string(),
+        mode: SetupMode::Uninstall,
+        refresh_only: false,
+    };
+    let needs_elevation = !is_elevated().map_err(|err| {
+        failure(
+            SetupErrorCode::OrchestratorElevationCheckFailed,
+            format!("failed to determine elevation state: {err}"),
+        )
+    })?;
+    run_setup_exe(&payload, needs_elevation, codex_home)
 }
 
 pub(crate) fn build_payload_roots(
@@ -1835,12 +1930,18 @@ mod tests {
         );
     }
 
+    fn sample_install_id() -> String {
+        let identity = crate::installation::SandboxInstallationIdentity::generate();
+        identity.install_id_hex()
+    }
+
     #[test]
     fn setup_marker_request_mismatch_reason_ignores_proxy_drift_for_online_identity() {
         let marker = super::SetupMarker {
             version: super::SETUP_VERSION,
             offline_username: "offline".to_string(),
             online_username: "online".to_string(),
+            install_id: Some(sample_install_id()),
             created_at: None,
             proxy_ports: vec![3128],
             allow_local_binding: false,
@@ -1851,7 +1952,11 @@ mod tests {
         };
 
         assert_eq!(
-            marker.request_mismatch_reason(super::SandboxNetworkIdentity::Online, &desired),
+            marker.request_mismatch_reason(
+                super::SandboxNetworkIdentity::Online,
+                &desired,
+                marker.install_id.as_deref(),
+            ),
             None
         );
     }
@@ -1862,6 +1967,7 @@ mod tests {
             version: super::SETUP_VERSION,
             offline_username: "offline".to_string(),
             online_username: "online".to_string(),
+            install_id: Some(sample_install_id()),
             created_at: None,
             proxy_ports: vec![3128],
             allow_local_binding: false,
@@ -1872,11 +1978,84 @@ mod tests {
         };
 
         assert_eq!(
-            marker.request_mismatch_reason(super::SandboxNetworkIdentity::Offline, &desired),
+            marker.request_mismatch_reason(
+                super::SandboxNetworkIdentity::Offline,
+                &desired,
+                marker.install_id.as_deref(),
+            ),
             Some(
                 "offline firewall settings changed (stored_ports=[3128], desired_ports=[1081, 8080], stored_allow_local_binding=false, desired_allow_local_binding=true)"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn setup_marker_request_mismatch_reason_reports_installation_identity_change() {
+        let install_id = sample_install_id();
+        let marker = super::SetupMarker {
+            version: super::SETUP_VERSION,
+            offline_username: "offline".to_string(),
+            online_username: "online".to_string(),
+            install_id: Some(install_id.clone()),
+            created_at: None,
+            proxy_ports: Vec::new(),
+            allow_local_binding: false,
+        };
+        let desired = super::OfflineProxySettings {
+            proxy_ports: Vec::new(),
+            allow_local_binding: false,
+        };
+        let other = {
+            let mut candidate = crate::installation::SandboxInstallationIdentity::generate();
+            while candidate.install_id_hex() == install_id {
+                candidate = crate::installation::SandboxInstallationIdentity::generate();
+            }
+            candidate.install_id_hex()
+        };
+
+        assert!(
+            marker
+                .request_mismatch_reason(
+                    super::SandboxNetworkIdentity::Offline,
+                    &desired,
+                    Some(&other),
+                )
+                .is_some(),
+            "a different persisted installation identity must force re-provisioning"
+        );
+        assert!(
+            marker
+                .request_mismatch_reason(super::SandboxNetworkIdentity::Offline, &desired, None,)
+                .is_some(),
+            "a missing persisted installation identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn setup_marker_without_install_id_always_reports_mismatch() {
+        let marker = super::SetupMarker {
+            version: super::SETUP_VERSION,
+            offline_username: "offline".to_string(),
+            online_username: "online".to_string(),
+            install_id: None,
+            created_at: None,
+            proxy_ports: Vec::new(),
+            allow_local_binding: false,
+        };
+        let desired = super::OfflineProxySettings {
+            proxy_ports: Vec::new(),
+            allow_local_binding: false,
+        };
+        assert!(
+            marker
+                .request_mismatch_reason(
+                    super::SandboxNetworkIdentity::Online,
+                    &desired,
+                    Some("0123456789abcdef0123456789abcdef"),
+                )
+                .is_some(),
+            "pre-scoping markers must be re-provisioned"
         );
     }
 

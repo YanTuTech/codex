@@ -5,6 +5,9 @@
 #[cfg(any(target_os = "windows", test))]
 mod ssh_config_dependencies;
 
+pub mod installation;
+pub mod setup_receipt;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -82,6 +85,8 @@ mod resolved_permissions;
 mod token;
 #[cfg(target_os = "windows")]
 mod wfp;
+#[cfg(target_os = "windows")]
+mod wfp_ownership;
 #[cfg(target_os = "windows")]
 mod wfp_setup;
 #[cfg(target_os = "windows")]
@@ -272,6 +277,7 @@ pub use setup::SetupRootOverrides;
 pub use setup::run_elevated_provisioning_setup;
 #[cfg(target_os = "windows")]
 pub use setup::run_elevated_setup;
+pub use setup::run_elevated_uninstall;
 #[cfg(target_os = "windows")]
 pub use setup::run_setup_refresh;
 #[cfg(target_os = "windows")]
@@ -282,6 +288,7 @@ pub use setup::sandbox_bin_dir;
 pub use setup::sandbox_dir;
 #[cfg(target_os = "windows")]
 pub use setup::sandbox_secrets_dir;
+pub use setup::sandbox_setup_account_names;
 #[cfg(target_os = "windows")]
 pub use setup_error::SetupErrorCode;
 #[cfg(target_os = "windows")]
@@ -326,7 +333,17 @@ pub use unified_exec::spawn_windows_sandbox_session_for_level;
 #[cfg(target_os = "windows")]
 pub use unified_exec::spawn_windows_sandbox_session_legacy;
 #[cfg(target_os = "windows")]
-pub use wfp::install_wfp_filters_for_account;
+#[cfg(target_os = "windows")]
+pub use wfp::filter_spec_names;
+#[cfg(target_os = "windows")]
+pub use wfp::install_wfp_filters_for_installation;
+#[cfg(target_os = "windows")]
+pub use wfp::read_live_filter_facts;
+#[cfg(target_os = "windows")]
+pub use wfp::remove_wfp_objects_for_installation;
+pub use wfp::wfp_objects_present;
+#[cfg(target_os = "windows")]
+pub use wfp_ownership::WfpOwnershipRecord;
 #[cfg(target_os = "windows")]
 pub use wfp_setup::install_wfp_filters;
 #[cfg(target_os = "windows")]

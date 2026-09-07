@@ -2,8 +2,8 @@ use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rand::RngCore;
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
+use rand::rngs::OsRng;
+use serde::Deserialize;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::ffi::c_void;
@@ -18,10 +18,16 @@ use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_INFO_1;
 use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_MEMBERS_INFO_3;
+use windows_sys::Win32::NetworkManagement::NetManagement::NERR_GroupNotFound;
 use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
+use windows_sys::Win32::NetworkManagement::NetManagement::NERR_UserNotFound;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAdd;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAddMembers;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupDel;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupGetInfo;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetUserAdd;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetUserDel;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetUserGetInfo;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetUserSetInfo;
 use windows_sys::Win32::NetworkManagement::NetManagement::UF_DONT_EXPIRE_PASSWD;
 use windows_sys::Win32::NetworkManagement::NetManagement::UF_SCRIPT;
@@ -51,50 +57,165 @@ use codex_windows_sandbox::sandbox_secrets_dir;
 use codex_windows_sandbox::string_from_sid_bytes;
 use codex_windows_sandbox::to_wide;
 
-pub const SANDBOX_USERS_GROUP: &str = "CodexSandboxUsers";
-const SANDBOX_USERS_GROUP_COMMENT: &str = "Codex sandbox internal group (managed)";
+const SANDBOX_USERS_GROUP_COMMENT: &str = "LeapSea sandbox internal group (installation-scoped)";
 const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
 const SID_USERS: &str = "S-1-5-32-545";
 const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 const SID_EVERYONE: &str = "S-1-1-0";
 const SID_SYSTEM: &str = "S-1-5-18";
 
-pub fn ensure_sandbox_users_group(log: &mut dyn Write) -> Result<()> {
-    ensure_local_group(SANDBOX_USERS_GROUP, SANDBOX_USERS_GROUP_COMMENT, log)
+use codex_windows_sandbox::installation::SandboxInstallationIdentity;
+
+pub fn ensure_sandbox_users_group(group_name: &str, log: &mut dyn Write) -> Result<()> {
+    ensure_local_group(group_name, SANDBOX_USERS_GROUP_COMMENT, log)
 }
 
-pub fn resolve_sandbox_users_group_sid() -> Result<Vec<u8>> {
-    resolve_sid(SANDBOX_USERS_GROUP)
+pub fn resolve_sandbox_users_group_sid(group_name: &str) -> Result<Vec<u8>> {
+    resolve_sid(group_name)
 }
 
 pub fn provision_sandbox_users(
     codex_home: &Path,
-    offline_username: &str,
-    online_username: &str,
+    identity: &SandboxInstallationIdentity,
     log: &mut dyn Write,
 ) -> Result<()> {
-    ensure_sandbox_users_group(log)?;
+    let group_name = identity.sandbox_group_name();
+    ensure_sandbox_users_group(&group_name, log)?;
+    let offline_username = identity.offline_username();
+    let online_username = identity.online_username();
     super::log_line(
         log,
         &format!("ensuring sandbox users offline={offline_username} online={online_username}"),
     )?;
-    let offline_password = random_password();
-    let online_password = random_password();
-    ensure_sandbox_user(offline_username, &offline_password, log)?;
-    ensure_sandbox_user(online_username, &online_password, log)?;
+    // Idempotent receipt: when the persisted secrets already describe this
+    // exact installation (version, derived account names, and a DPAPI blob
+    // that still decrypts), reuse the recorded passwords instead of rotating
+    // them, so identical requested state converges to identical state.
+    let persisted =
+        read_persisted_secrets_if_matching(codex_home, &offline_username, &online_username);
+    let (offline_password, online_password) = match persisted {
+        Some(passwords) => {
+            super::log_line(
+                log,
+                "reusing persisted sandbox credentials for this installation",
+            )?;
+            passwords
+        }
+        None => (random_password(), random_password()),
+    };
+    ensure_sandbox_user(&group_name, &offline_username, &offline_password, log)?;
+    ensure_sandbox_user(&group_name, &online_username, &online_password, log)?;
     write_secrets(
         codex_home,
-        offline_username,
+        &offline_username,
         &offline_password,
-        online_username,
+        &online_username,
         &online_password,
     )?;
     Ok(())
 }
 
-pub fn ensure_sandbox_user(username: &str, password: &str, log: &mut dyn Write) -> Result<()> {
+/// Names of the derived accounts and group that still exist. Absence is
+/// claimed only from the Net APIs' explicit not-found codes.
+pub fn accounts_present(identity: &SandboxInstallationIdentity) -> Vec<String> {
+    let mut present = Vec::new();
+    for username in [identity.offline_username(), identity.online_username()] {
+        let wide = to_wide(OsStr::new(&username));
+        let status =
+            unsafe { NetUserGetInfo(std::ptr::null(), wide.as_ptr(), 0, std::ptr::null_mut()) };
+        if status != NERR_UserNotFound {
+            // Any other status (success or query failure) claims presence so
+            // absence can never rest on a broken query.
+            present.push(username);
+        }
+    }
+    let group = identity.sandbox_group_name();
+    let wide = to_wide(OsStr::new(&group));
+    let status =
+        unsafe { NetLocalGroupGetInfo(std::ptr::null(), wide.as_ptr(), 0, std::ptr::null_mut()) };
+    if status != NERR_GroupNotFound {
+        present.push(group);
+    }
+    present
+}
+
+/// Removes exactly the accounts and group derived from `identity`. Missing
+/// accounts are treated as success so uninstall is resumable.
+pub fn remove_sandbox_users(
+    identity: &SandboxInstallationIdentity,
+    log: &mut dyn Write,
+) -> Result<()> {
+    for username in [identity.offline_username(), identity.online_username()] {
+        let username_w = to_wide(OsStr::new(&username));
+        let status = unsafe { NetUserDel(std::ptr::null(), username_w.as_ptr()) };
+        if status == NERR_Success || status == NERR_UserNotFound {
+            super::log_line(
+                log,
+                &format!("removed sandbox user {username} (status {status})"),
+            )?;
+        } else {
+            super::log_line(
+                log,
+                &format!("NetUserDel failed for {username} code {status}; continuing"),
+            )?;
+        }
+    }
+    let group_name = identity.sandbox_group_name();
+    let group_w = to_wide(OsStr::new(&group_name));
+    let status = unsafe { NetLocalGroupDel(std::ptr::null(), group_w.as_ptr()) };
+    if status == NERR_Success || status == NERR_GroupNotFound {
+        super::log_line(log, &format!("removed sandbox group {group_name}"))?;
+    } else {
+        super::log_line(
+            log,
+            &format!("NetLocalGroupDel failed for {group_name} code {status}; continuing"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Reads the persisted secrets file when it matches this installation's
+/// derived account names and decrypts cleanly; returns the two passwords.
+fn read_persisted_secrets_if_matching(
+    codex_home: &Path,
+    offline_username: &str,
+    online_username: &str,
+) -> Option<(String, String)> {
+    let path = sandbox_secrets_dir(codex_home).join("sandbox_users.json");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let file: SandboxUsersFile = serde_json::from_str(&contents).ok()?;
+    if file.version != SETUP_VERSION {
+        return None;
+    }
+    if file.offline.username != offline_username || file.online.username != online_username {
+        return None;
+    }
+    let offline = decode_persisted_password(&file.offline.password)?;
+    let online = decode_persisted_password(&file.online.password)?;
+    Some((offline, online))
+}
+
+fn decode_persisted_password(b64: &str) -> Option<String> {
+    use base64::Engine;
+    let blob = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let decrypted = dpapi_protect_unprotect_for_reuse(&blob)?;
+    String::from_utf8(decrypted).ok()
+}
+
+/// DPAPI unprotect helper for credential reuse. Returns `None` on any
+/// failure so callers fall back to rotating the password.
+fn dpapi_protect_unprotect_for_reuse(blob: &[u8]) -> Option<Vec<u8>> {
+    codex_windows_sandbox::dpapi_unprotect(blob).ok()
+}
+
+pub fn ensure_sandbox_user(
+    group_name: &str,
+    username: &str,
+    password: &str,
+    log: &mut dyn Write,
+) -> Result<()> {
     ensure_local_user(username, password, log)?;
-    ensure_local_group_member(SANDBOX_USERS_GROUP, username)?;
+    ensure_local_group_member(group_name, username)?;
     Ok(())
 }
 
@@ -366,7 +487,7 @@ pub fn sid_bytes_to_psid(sid: &[u8]) -> Result<*mut c_void> {
 fn random_password() -> String {
     const CHARS: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+";
-    let mut rng = SmallRng::from_entropy();
+    let mut rng = OsRng;
     let mut buf = [0u8; 24];
     rng.fill_bytes(&mut buf);
     buf.iter()
@@ -377,13 +498,13 @@ fn random_password() -> String {
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SandboxUserRecord {
     username: String,
     password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SandboxUsersFile {
     version: u32,
     offline: SandboxUserRecord,
@@ -395,6 +516,7 @@ struct SetupMarker {
     version: u32,
     offline_username: String,
     online_username: String,
+    install_id: String,
     created_at: String,
     proxy_ports: Vec<u16>,
     allow_local_binding: bool,
@@ -550,20 +672,22 @@ pub(super) fn prepare_setup_marker(codex_home: &Path, real_user: &str) -> Result
 
 pub(super) fn commit_setup_marker(
     codex_home: &Path,
-    offline_user: &str,
-    online_user: &str,
+    identity: &SandboxInstallationIdentity,
     proxy_ports: &[u16],
     allow_local_binding: bool,
+    read_roots: &[PathBuf],
+    write_roots: &[PathBuf],
 ) -> Result<()> {
     let marker = SetupMarker {
         version: SETUP_VERSION,
-        offline_username: offline_user.to_string(),
-        online_username: online_user.to_string(),
+        offline_username: identity.offline_username(),
+        online_username: identity.online_username(),
+        install_id: identity.install_id_hex(),
         created_at: chrono::Utc::now().to_rfc3339(),
         proxy_ports: proxy_ports.to_vec(),
         allow_local_binding,
-        read_roots: Vec::new(),
-        write_roots: Vec::new(),
+        read_roots: read_roots.to_vec(),
+        write_roots: write_roots.to_vec(),
     };
     let marker_path = sandbox_dir(codex_home).join("setup_marker.json");
     let marker_json = serde_json::to_vec_pretty(&marker).map_err(|err| {

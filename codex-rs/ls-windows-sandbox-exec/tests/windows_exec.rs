@@ -417,15 +417,63 @@ mod containment_matrix {
     use std::time::Duration;
     use std::time::Instant;
 
-    /// A fresh workspace + sandbox-state pair plus an external target
-    /// directory outside every writable root. Dropping the fixture removes
-    /// the whole tree.
+    /// A fresh workspace plus an external target directory outside every
+    /// writable root. The sandbox state directory is a single shared
+    /// installation identity for the whole matrix: the first fixture
+    /// completes the product-scoped elevated setup once (one administrator
+    /// consent), and every subsequent test reuses it, matching the plan's
+    /// "fresh product-scoped installation identity" qualification setup.
     struct Fixture {
         _base: tempfile::TempDir,
         workspace: PathBuf,
         codex_home: PathBuf,
         external_dir: PathBuf,
         external_file: PathBuf,
+    }
+
+    /// Shared installation home, stable for this test binary run.
+    static SHARED_INSTALL_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+    #[allow(clippy::unwrap_used)] // test scaffolding: a failed fixture is the assertion
+    fn shared_installation_home() -> PathBuf {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().parent().unwrap().to_path_buf());
+        let home = local.join(format!("ls-sbx-qual-install-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let canonical = dunce::canonicalize(&home).unwrap();
+        // The runner rejects an overlapping --workspace-root/--codex-home, so
+        // the warm-up spawn uses a SIBLING directory as its workspace root.
+        let warmup_workspace = local.join(format!("ls-sbx-qual-warmup-{}", std::process::id()));
+        std::fs::create_dir_all(&warmup_workspace).unwrap();
+        let warmup_canonical = dunce::canonicalize(&warmup_workspace).unwrap();
+        // Warm the installation exactly once, inside the lock: the first
+        // sandboxed spawn performs the elevated setup (one UAC consent per
+        // matrix run) and concurrent fixtures must not race a second setup.
+        SHARED_INSTALL_HOME
+            .get_or_init(|| {
+                let warm = Command::new(runner())
+                    .args([
+                        "--workspace-root",
+                        warmup_canonical.to_string_lossy().as_ref(),
+                        "--codex-home",
+                        canonical.to_string_lossy().as_ref(),
+                        "--",
+                        "cmd",
+                        "/c",
+                        "exit 0",
+                    ])
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    warm.status.code(),
+                    Some(0),
+                    "shared installation warm-up failed; stderr: {}",
+                    String::from_utf8_lossy(&warm.stderr)
+                );
+                canonical.clone()
+            })
+            .clone()
     }
 
     #[allow(clippy::unwrap_used)] // test scaffolding: a failed fixture is the assertion
@@ -436,15 +484,13 @@ mod containment_matrix {
                 .unwrap_or_else(|| std::env::temp_dir().parent().unwrap().to_path_buf());
             let base = tempfile::TempDir::new_in(&local).unwrap();
             let workspace = base.path().join("workspace");
-            let codex_home = base.path().join("state");
             let external_dir = base.path().join("target");
             std::fs::create_dir(&workspace).unwrap();
-            std::fs::create_dir(&codex_home).unwrap();
             std::fs::create_dir(&external_dir).unwrap();
             let external_file = external_dir.join("victim.txt");
             std::fs::write(&external_file, b"original").unwrap();
             let workspace = dunce::canonicalize(&workspace).unwrap();
-            let codex_home = dunce::canonicalize(&codex_home).unwrap();
+            let codex_home = shared_installation_home();
             let external_dir = dunce::canonicalize(&external_dir).unwrap();
             let external_file = dunce::canonicalize(&external_file).unwrap();
             // The matrix scripts redirect to unquoted paths, so every fixture
@@ -848,7 +894,6 @@ mod containment_matrix {
     }
 
     #[test]
-    #[ignore = "host-specific observation: RestrictedToken has no kernel-level network boundary"]
     fn manual_loopback_network_observation() {
         let fixture = Fixture::new();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -902,7 +947,6 @@ mod containment_matrix {
     }
 
     #[test]
-    #[ignore = "host-specific observation: RestrictedToken has no kernel-level network boundary"]
     fn manual_external_network_observation() {
         let fixture = Fixture::new();
         // Raw TCP to a well-known anycast address, no DNS involved. The
@@ -967,11 +1011,22 @@ mod containment_matrix {
             "auth canary leaked: {deepseek_out}"
         );
 
+        // Elevated backend: network confinement is kernel-enforced (WFP);
+        // the restricted-token environment marker must NOT be present, and
+        // no dead-proxy variable may masquerade as the boundary.
         let marker = spawn_sandboxed("echo NONET=%SBX_NONET_ACTIVE%");
         let marker_out = String::from_utf8_lossy(&marker.stdout).to_string();
         assert!(
-            marker_out.contains("NONET=1"),
-            "component network marker must be set; got: {marker_out:?}"
+            !marker_out.contains("NONET=1"),
+            "elevated backend must not rely on the restricted-token env marker; got: {marker_out:?}"
+        );
+        let proxies = spawn_sandboxed(
+            "if defined HTTP_PROXY echo PROXY-HTTP & if defined HTTPS_PROXY echo PROXY-HTTPS",
+        );
+        let proxies_out = String::from_utf8_lossy(&proxies.stdout).to_string();
+        assert!(
+            !proxies_out.contains("PROXY-HTTP") && !proxies_out.contains("PROXY-HTTPS"),
+            "no proxy environment may be observable inside the sandbox; got: {proxies_out:?}"
         );
 
         // Canary values must never appear in any captured output.
@@ -980,5 +1035,236 @@ mod containment_matrix {
             !all.contains("canary-opencode-value") && !all.contains("canary-deepseek-value"),
             "canary values must never appear in output"
         );
+    }
+
+    // ---- Elevated qualification matrix (Task 4) ---------------------------
+
+    /// Runs a tool with arguments inside the sandbox and returns the output,
+    /// with every proxy variable cleared so network outcomes prove the
+    /// kernel boundary rather than environment behavior.
+    #[allow(clippy::unwrap_used)] // test scaffolding: a failed spawn is the assertion
+    fn run_tool(fixture: &Fixture, tool: &str, args: &[&str]) -> Output {
+        let mut all = vec![
+            "--workspace-root".to_string(),
+            fixture.workspace.to_string_lossy().to_string(),
+            "--codex-home".to_string(),
+            fixture.codex_home.to_string_lossy().to_string(),
+            "--".to_string(),
+        ];
+        all.push(tool.to_string());
+        all.extend(args.iter().map(std::string::ToString::to_string));
+        Command::new(runner())
+            .args(&all)
+            .env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("ALL_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn powershell_command_host_qualification() {
+        let fixture = Fixture::new();
+        let output = run_tool(
+            &fixture,
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Set-Content -Path ps-ok.txt -Value ok; Get-Content ps-ok.txt",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "powershell must run; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            stdout.contains("ok"),
+            "powershell output forwarded: {stdout:?}"
+        );
+    }
+
+    #[test]
+    fn python_command_host_qualification() {
+        let fixture = Fixture::new();
+        let output = run_tool(
+            &fixture,
+            "python",
+            &[
+                "-c",
+                "from pathlib import Path; Path('py-ok.txt').write_text('ok', encoding='utf-8'); print(Path('py-ok.txt').read_text(encoding='utf-8'))",
+            ],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "python must run; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(stdout.contains("ok"), "python output forwarded: {stdout:?}");
+    }
+
+    #[test]
+    fn node_command_host_qualification() {
+        let fixture = Fixture::new();
+        let script = "const fs = require('fs'); fs.writeFileSync('node-ok.txt', 'ok'); process.stdout.write(fs.readFileSync('node-ok.txt', 'utf8'));";
+        let output = run_tool(&fixture, "node", &["-e", script]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "node must run; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(stdout.contains("ok"), "node output forwarded: {stdout:?}");
+    }
+
+    #[test]
+    fn git_command_host_qualification() {
+        let fixture = Fixture::new();
+        let init = run_tool(&fixture, "git", &["init", "."]);
+        assert_eq!(
+            init.status.code(),
+            Some(0),
+            "git init must run; stderr: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let status = run_tool(&fixture, "git", &["status", "--porcelain"]);
+        assert_eq!(status.status.code(), Some(0));
+    }
+
+    #[test]
+    fn cjk_and_space_paths_round_trip() {
+        let fixture = Fixture::new();
+        let output = fixture.run_cmd("echo hi > \"\u{4e2d}\u{6587} \u{6587}\u{4ef6}.txt\" && type \"\u{4e2d}\u{6587} \u{6587}\u{4ef6}.txt\"");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "CJK + space filename must round-trip; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cjk_name = format!("{} {}.txt", "\u{4e2d}\u{6587}", "\u{6587}\u{4ef6}");
+        assert!(fixture.workspace.join(cjk_name).exists());
+    }
+
+    #[test]
+    fn nonzero_exit_code_is_forwarded() {
+        let fixture = Fixture::new();
+        let output = run_tool(&fixture, "cmd", &["/c", "exit 42"]);
+        assert_eq!(output.status.code(), Some(42));
+    }
+
+    #[test]
+    fn large_bounded_output_is_forwarded() {
+        let fixture = Fixture::new();
+        let output = fixture.run_cmd(
+            "for /l %i in (1,1,32768) do @echo 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "large output run must succeed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.len() > 1024 * 1024,
+            "large output must be forwarded; got {} bytes",
+            output.stdout.len()
+        );
+    }
+
+    #[test]
+    fn external_read_canary_is_denied() {
+        let fixture = Fixture::new();
+        let victim = fixture.external_file.to_string_lossy().to_string();
+        let code = format!(
+            "import sys; data = open(r'{victim}', 'rb').read(); sys.exit(0 if data == b'original' else 3)"
+        );
+        let read = run_tool(&fixture, "python", &["-c", &code]);
+        assert_ne!(
+            read.status.code(),
+            Some(0),
+            "external read canary must be denied; stdout: {} stderr: {}",
+            String::from_utf8_lossy(&read.stdout),
+            String::from_utf8_lossy(&read.stderr)
+        );
+    }
+
+    #[test]
+    fn python_raw_socket_and_dns_are_denied() {
+        let fixture = Fixture::new();
+        let tcp = run_tool(
+            &fixture,
+            "python",
+            &[
+                "-c",
+                "import socket; s = socket.create_connection(('1.1.1.1', 443), timeout=5); s.close(); print('CONNECTED')",
+            ],
+        );
+        let tcp_out = String::from_utf8_lossy(&tcp.stdout).to_string();
+        assert!(
+            !tcp_out.contains("CONNECTED"),
+            "raw TCP must be kernel-denied; got: {tcp_out:?}"
+        );
+        let dns = run_tool(
+            &fixture,
+            "python",
+            &[
+                "-c",
+                "import socket; socket.create_connection(('example.org', 443), timeout=5); print('DNS-CONNECTED')",
+            ],
+        );
+        let dns_out = String::from_utf8_lossy(&dns.stdout).to_string();
+        assert!(
+            !dns_out.contains("DNS-CONNECTED"),
+            "DNS-dependent connect must be kernel-denied; got: {dns_out:?}"
+        );
+    }
+
+    #[test]
+    fn child_grandchild_network_is_denied() {
+        let fixture = Fixture::new();
+        let script = "import subprocess, sys; out = subprocess.run([sys.executable, '-c', \"import socket; socket.create_connection(('1.1.1.1', 443), timeout=4); print('GC-CONNECTED')\"], capture_output=True, text=True); sys.stdout.write(out.stdout)";
+        let output = run_tool(&fixture, "python", &["-c", script]);
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            !out.contains("GC-CONNECTED"),
+            "grandchild network must be kernel-denied; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn setup_rerun_is_idempotent_for_the_installation() {
+        let fixture = Fixture::new();
+        let marker = fixture
+            .codex_home
+            .join(".sandbox")
+            .join("setup_marker.json");
+        let before = std::fs::read(&marker).unwrap();
+        let output = fixture.run_cmd("echo warm > warm.txt");
+        assert_eq!(output.status.code(), Some(0));
+        let after = std::fs::read(&marker).unwrap();
+        if before != after {
+            let parse_field = |bytes: &[u8]| -> String {
+                let text = String::from_utf8_lossy(bytes).to_string();
+                text.lines()
+                    .find(|line| line.contains("\"install_id\""))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            };
+            assert_eq!(
+                parse_field(&before),
+                parse_field(&after),
+                "setup rerun must keep the same installation identity"
+            );
+        }
     }
 }

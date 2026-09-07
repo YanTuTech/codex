@@ -27,18 +27,31 @@ use windows::core::Interface;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupFailure;
 
-// This is the stable identifier we use to find/update the rule idempotently.
-// It intentionally does not change between installs.
-const OFFLINE_BLOCK_RULE_NAME: &str = "codex_sandbox_offline_block_outbound";
-const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME: &str = "codex_sandbox_offline_block_loopback_tcp";
-const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME: &str = "codex_sandbox_offline_block_loopback_udp";
+// Firewall rule identities are derived from the sandbox installation
+// identity, so every installation owns its own rule names and never touches
+// Codex-global `codex_sandbox_*` rules or another installation's rules.
+// Friendly text shown in the firewall UI is likewise installation-scoped.
 
-// Friendly text shown in the firewall UI.
-const OFFLINE_BLOCK_RULE_FRIENDLY: &str = "Codex Sandbox Offline - Block Non-Loopback Outbound";
-const OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY: &str =
-    "Codex Sandbox Offline - Block Loopback TCP (Except Proxy)";
-const OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY: &str = "Codex Sandbox Offline - Block Loopback UDP";
-const OFFLINE_PROXY_ALLOW_RULE_NAME: &str = "codex_sandbox_offline_allow_loopback_proxy";
+use codex_windows_sandbox::installation::SandboxInstallationIdentity;
+
+struct FirewallRuleNames {
+    offline_block: String,
+    offline_block_loopback_tcp: String,
+    offline_block_loopback_udp: String,
+    offline_allow_loopback_proxy: String,
+}
+
+impl FirewallRuleNames {
+    fn for_identity(identity: &SandboxInstallationIdentity) -> Self {
+        Self {
+            offline_block: identity.offline_block_rule_name(),
+            offline_block_loopback_tcp: identity.offline_block_loopback_tcp_rule_name(),
+            offline_block_loopback_udp: identity.offline_block_loopback_udp_rule_name(),
+            offline_allow_loopback_proxy: identity.offline_allow_loopback_proxy_rule_name(),
+        }
+    }
+}
+
 const LOOPBACK_REMOTE_ADDRESSES: &str = "127.0.0.0/8,::/127";
 const NON_LOOPBACK_REMOTE_ADDRESSES: &str = "0.0.0.0-126.255.255.255,128.0.0.0-255.255.255.255,::,::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff";
 
@@ -52,12 +65,110 @@ struct BlockRuleSpec<'a> {
     remote_ports: Option<&'a str>,
 }
 
+/// Returns the names of this installation's firewall rules that still
+/// exist. Queries by exact derived name only; other installations' rules
+/// (including Codex-global `codex_sandbox_*`) are never addressed. A failed
+/// query reports EVERY name as present so absence can never be claimed
+/// without a working query.
+pub fn firewall_rules_present(identity: &SandboxInstallationIdentity) -> Vec<String> {
+    let names = FirewallRuleNames::for_identity(identity);
+    let all_names = [
+        names.offline_block,
+        names.offline_block_loopback_tcp,
+        names.offline_block_loopback_udp,
+        names.offline_allow_loopback_proxy,
+    ];
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return all_names.to_vec();
+    }
+    let queried: Result<Vec<String>, ()> = unsafe {
+        (|| {
+            let policy: INetFwPolicy2 =
+                CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER).map_err(|_| ())?;
+            let rules = policy.Rules().map_err(|_| ())?;
+            let mut present = Vec::new();
+            for name in &all_names {
+                let wide = BSTR::from(name.as_str());
+                // Item() errors for a missing rule: presence is exactly
+                // "Item() succeeded".
+                if rules.Item(&wide).is_ok() {
+                    present.push(name.clone());
+                }
+            }
+            Ok(present)
+        })()
+    };
+    unsafe {
+        CoUninitialize();
+    }
+    match queried {
+        Ok(present) => present,
+        // Query infrastructure failed: fail closed, claim everything.
+        Err(()) => all_names.to_vec(),
+    }
+}
+
+/// Removes exactly the four firewall rules derived from `identity`. Rules
+/// owned by other installations (including Codex-global names) are never
+/// addressed.
+pub fn remove_offline_rules_for_identity(
+    identity: &SandboxInstallationIdentity,
+    log: &mut dyn Write,
+) -> Result<()> {
+    let names = FirewallRuleNames::for_identity(identity);
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    if hr.is_err() {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperFirewallComInitFailed,
+            format!("CoInitializeEx failed: {hr:?}"),
+        )));
+    }
+    let result = unsafe {
+        (|| -> Result<()> {
+            let policy: INetFwPolicy2 = CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)
+                .map_err(|err| {
+                    anyhow::Error::new(SetupFailure::new(
+                        SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                        format!("CoCreateInstance NetFwPolicy2 failed: {err:?}"),
+                    ))
+                })?;
+            let rules = policy.Rules().map_err(|err| {
+                anyhow::Error::new(SetupFailure::new(
+                    SetupErrorCode::HelperFirewallPolicyAccessFailed,
+                    format!("INetFwPolicy2::Rules failed: {err:?}"),
+                ))
+            })?;
+            for rule_name in [
+                names.offline_block.as_str(),
+                names.offline_block_loopback_tcp.as_str(),
+                names.offline_block_loopback_udp.as_str(),
+                names.offline_allow_loopback_proxy.as_str(),
+            ] {
+                remove_rule_if_present(&rules, rule_name, log)?;
+            }
+            Ok(())
+        })()
+    };
+    unsafe {
+        CoUninitialize();
+    }
+    result
+}
+
 pub fn ensure_offline_proxy_allowlist(
+    identity: &SandboxInstallationIdentity,
     offline_sid: &str,
     proxy_ports: &[u16],
     allow_local_binding: bool,
     log: &mut dyn Write,
 ) -> Result<()> {
+    let names = FirewallRuleNames::for_identity(identity);
+    let suffix = identity.install_suffix();
+    let offline_block_friendly = format!("LeapSea Sandbox {suffix} - Block Non-Loopback Outbound");
+    let loopback_tcp_friendly =
+        format!("LeapSea Sandbox {suffix} - Block Loopback TCP (Except Proxy)");
+    let loopback_udp_friendly = format!("LeapSea Sandbox {suffix} - Block Loopback UDP");
     let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
 
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -88,17 +199,17 @@ pub fn ensure_offline_proxy_allowlist(
             if allow_local_binding {
                 // Remove the legacy overlapping allow rule before returning to the local-binding
                 // mode so stale proxy exceptions do not linger.
-                remove_rule_if_present(&rules, OFFLINE_PROXY_ALLOW_RULE_NAME, log)?;
-                remove_rule_if_present(&rules, OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME, log)?;
-                remove_rule_if_present(&rules, OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME, log)?;
+                remove_rule_if_present(&rules, &names.offline_allow_loopback_proxy, log)?;
+                remove_rule_if_present(&rules, &names.offline_block_loopback_udp, log)?;
+                remove_rule_if_present(&rules, &names.offline_block_loopback_tcp, log)?;
                 return Ok(());
             }
 
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
+                    internal_name: &names.offline_block_loopback_udp,
+                    friendly_desc: &loopback_udp_friendly,
                     protocol: NET_FW_IP_PROTOCOL_UDP.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -113,8 +224,8 @@ pub fn ensure_offline_proxy_allowlist(
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                    internal_name: &names.offline_block_loopback_tcp,
+                    friendly_desc: &loopback_tcp_friendly,
                     protocol: NET_FW_IP_PROTOCOL_TCP.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -126,14 +237,14 @@ pub fn ensure_offline_proxy_allowlist(
 
             // Remove the legacy overlapping allow rule only after the explicit block rules are in
             // place so transitions back to proxy-only mode do not fail open.
-            remove_rule_if_present(&rules, OFFLINE_PROXY_ALLOW_RULE_NAME, log)?;
+            remove_rule_if_present(&rules, &names.offline_allow_loopback_proxy, log)?;
 
             if let Some(blocked_remote_ports) = blocked_loopback_tcp_remote_ports(proxy_ports) {
                 ensure_block_rule(
                     &rules,
                     &BlockRuleSpec {
-                        internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
-                        friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                        internal_name: &names.offline_block_loopback_tcp,
+                        friendly_desc: &loopback_tcp_friendly,
                         protocol: NET_FW_IP_PROTOCOL_TCP.0,
                         local_user_spec: &local_user_spec,
                         offline_sid,
@@ -147,13 +258,23 @@ pub fn ensure_offline_proxy_allowlist(
         })()
     };
 
+    let _ = offline_block_friendly;
     unsafe {
         CoUninitialize();
     }
     result
 }
 
-pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> Result<()> {
+pub fn ensure_offline_outbound_block(
+    identity: &SandboxInstallationIdentity,
+    offline_sid: &str,
+    log: &mut dyn Write,
+) -> Result<()> {
+    let names = FirewallRuleNames::for_identity(identity);
+    let offline_block_friendly = format!(
+        "LeapSea Sandbox {} - Block Non-Loopback Outbound",
+        identity.install_suffix()
+    );
     let local_user_spec = format!("O:LSD:(A;;CC;;;{offline_sid})");
 
     let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
@@ -185,8 +306,8 @@ pub fn ensure_offline_outbound_block(offline_sid: &str, log: &mut dyn Write) -> 
             ensure_block_rule(
                 &rules,
                 &BlockRuleSpec {
-                    internal_name: OFFLINE_BLOCK_RULE_NAME,
-                    friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
+                    internal_name: &names.offline_block,
+                    friendly_desc: &offline_block_friendly,
                     protocol: NET_FW_IP_PROTOCOL_ANY.0,
                     local_user_spec: &local_user_spec,
                     offline_sid,
@@ -513,12 +634,15 @@ mod tests {
 
         let local_user_spec = "O:LSD:(A;;CC;;;S-1-5-18)";
         let offline_sid = "S-1-5-18";
+        let identity = SandboxInstallationIdentity::generate();
+        let names = FirewallRuleNames::for_identity(&identity);
+        let suffix = identity.install_suffix();
         let blocked_remote_ports =
             blocked_loopback_tcp_remote_ports(&[8080]).expect("proxy-port complement should exist");
         let specs = [
             BlockRuleSpec {
-                internal_name: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_NAME,
-                friendly_desc: OFFLINE_BLOCK_LOOPBACK_UDP_RULE_FRIENDLY,
+                internal_name: &names.offline_block_loopback_udp,
+                friendly_desc: &format!("LeapSea Sandbox {suffix} - Block Loopback UDP"),
                 protocol: NET_FW_IP_PROTOCOL_UDP.0,
                 local_user_spec,
                 offline_sid,
@@ -526,8 +650,8 @@ mod tests {
                 remote_ports: None,
             },
             BlockRuleSpec {
-                internal_name: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_NAME,
-                friendly_desc: OFFLINE_BLOCK_LOOPBACK_TCP_RULE_FRIENDLY,
+                internal_name: &names.offline_block_loopback_tcp,
+                friendly_desc: &format!("LeapSea Sandbox {suffix} - Block Loopback TCP"),
                 protocol: NET_FW_IP_PROTOCOL_TCP.0,
                 local_user_spec,
                 offline_sid,
@@ -535,8 +659,8 @@ mod tests {
                 remote_ports: Some(&blocked_remote_ports),
             },
             BlockRuleSpec {
-                internal_name: OFFLINE_BLOCK_RULE_NAME,
-                friendly_desc: OFFLINE_BLOCK_RULE_FRIENDLY,
+                internal_name: &names.offline_block,
+                friendly_desc: &format!("LeapSea Sandbox {suffix} - Block Non-Loopback Outbound"),
                 protocol: NET_FW_IP_PROTOCOL_ANY.0,
                 local_user_spec,
                 offline_sid,

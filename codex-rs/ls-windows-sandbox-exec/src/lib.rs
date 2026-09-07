@@ -6,8 +6,11 @@
 //! projection to the shared `codex-windows-sandbox` implementation; this crate
 //! never hand-writes token, ACL, Job Object, or WFP policy. It accepts exactly
 //! one canonical workspace root and a fixed `workspace-write` profile. The
-//! RestrictedToken backend's network posture is environment-soft rather than
-//! a kernel boundary, so callers must not treat it as hard network isolation.
+//! live path selects only the product-scoped `Elevated` backend: kernel WFP
+//! network denial, restricted reads, and a dedicated low-privilege identity
+//! come from the administrator-approved installation setup. The
+//! RestrictedToken backend is reachable only by native qualification tests,
+//! never by a runtime flag or automatic fallback.
 //!
 //! Runner-own failures (argument errors, unusable roots, spawn errors, or a
 //! missing sandbox prerequisite) print a single
@@ -61,12 +64,14 @@ const PRESERVED_ENV_KEYS: &[(&str, &str)] = &[
 ];
 
 /// The internally selected Windows sandbox level for the frozen filesystem
-/// write/process contract. No automatic fallback to the elevated backend
-/// exists; hard network and restricted-read isolation require a separately
-/// provisioned elevated path.
+/// write/process contract. The live path selects only the Codex `Elevated`
+/// backend: kernel-enforced network denial and restricted reads require the
+/// product-scoped elevated installation (accounts, ACLs, WFP). The
+/// Restricted Token backend remains reachable only by native qualification
+/// tests, never by a runtime flag or fallback.
 #[cfg(target_os = "windows")]
 pub fn selected_windows_sandbox_level() -> WindowsSandboxLevel {
-    WindowsSandboxLevel::RestrictedToken
+    WindowsSandboxLevel::Elevated
 }
 
 /// Parsed runner inputs that do not depend on the command being executed.
@@ -92,8 +97,8 @@ pub struct WindowsSandboxExecOptions {
 pub struct WindowsSandboxLaunchPlan {
     /// Exactly one materialized writable workspace root.
     pub workspace_roots: Vec<AbsolutePathBuf>,
-    /// Fixed Codex managed `workspace-write` profile. Its Restricted network
-    /// projection is environment-soft on this backend.
+    /// Fixed Codex managed `workspace-write` profile with restricted
+    /// network; enforcement comes from the selected backend.
     pub permission_profile: PermissionProfile,
     /// Validated sandbox state directory.
     pub codex_home: PathBuf,
@@ -368,6 +373,12 @@ mod windows_backend {
     /// widening knob pinned shut: no read/write root overrides, no deny-list
     /// overrides, no proxy or network elevation, no private desktop, and no
     /// backend-enforced timeout (the runner enforces its own 124 semantics).
+    ///
+    /// Descendants are preserved at the backend level because the elevated
+    /// backend does not support terminating them on root exit; the runner's
+    /// own exit paths always call `session.terminate()`, which kills the
+    /// whole non-breakaway Job Object (kill-on-close), so nothing survives a
+    /// completed or timed-out tool call.
     pub fn build_session_request(
         plan: &WindowsSandboxLaunchPlan,
     ) -> WindowsSandboxSessionRequest<'_> {
@@ -395,8 +406,13 @@ mod windows_backend {
             deny_write_paths_override: &plan.deny_write_paths,
             tty: false,
             stdin_open: false,
-            use_private_desktop: false,
-            preserve_descendants_on_root_exit: false,
+            // V1 security profile: the sandboxed command runs on a private
+            // desktop so it cannot interact with the user's interactive
+            // desktop.
+            use_private_desktop: true,
+            // The elevated backend requires descendants to be preserved at
+            // the session level; the runner terminates the full tree itself.
+            preserve_descendants_on_root_exit: true,
         }
     }
 
@@ -694,13 +710,20 @@ mod tests {
             assert_eq!(request.deny_write_paths_override, plan.deny_write_paths);
             assert!(!request.proxy_enforced);
             assert!(request.network_proxy_restricting_sid.is_none());
-            assert!(!request.use_private_desktop);
+            assert!(request.use_private_desktop);
             assert!(!request.tty);
             assert!(!request.stdin_open);
-            assert!(!request.preserve_descendants_on_root_exit);
+            assert!(
+                request.use_private_desktop,
+                "the frozen profile must run on a private desktop"
+            );
+            // Required by the elevated backend; the runner owns tree
+            // termination through session.terminate() on every exit path.
+            assert!(request.preserve_descendants_on_root_exit);
             assert_eq!(
                 request.windows_sandbox_level,
-                WindowsSandboxLevel::RestrictedToken
+                WindowsSandboxLevel::Elevated,
+                "the live facade path must select only the elevated backend"
             );
             // The runner owns the timeout (124 semantics), not the backend.
             assert_eq!(request.timeout_ms, None);

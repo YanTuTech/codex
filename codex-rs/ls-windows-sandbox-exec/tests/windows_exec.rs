@@ -479,10 +479,13 @@ mod containment_matrix {
     #[allow(clippy::unwrap_used)] // test scaffolding: a failed fixture is the assertion
     impl Fixture {
         fn new() -> Fixture {
-            let local = std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| std::env::temp_dir().parent().unwrap().to_path_buf());
-            let base = tempfile::TempDir::new_in(&local).unwrap();
+            // AppData is deliberately outside the default readable roots.
+            // PowerShell/Git inspect cwd ancestors, so a positive fixture
+            // there tests denied metadata access rather than command support.
+            // Keep installation state private; only inert test workspaces
+            // live under the readable Public root, without widening ACLs.
+            let public = PathBuf::from(std::env::var_os("PUBLIC").unwrap());
+            let base = tempfile::TempDir::new_in(&public).unwrap();
             let workspace = base.path().join("workspace");
             let external_dir = base.path().join("target");
             std::fs::create_dir(&workspace).unwrap();
@@ -1088,6 +1091,13 @@ mod containment_matrix {
             stdout.contains("ok"),
             "powershell output forwarded: {stdout:?}"
         );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.join("ps-ok.txt"))
+                .unwrap()
+                .trim(),
+            "ok",
+            "PowerShell must write into the requested workspace"
+        );
     }
 
     #[test]
@@ -1115,7 +1125,11 @@ mod containment_matrix {
     fn node_command_host_qualification() {
         let fixture = Fixture::new();
         let script = "const fs = require('fs'); fs.writeFileSync('node-ok.txt', 'ok'); process.stdout.write(fs.readFileSync('node-ok.txt', 'utf8'));";
-        let output = run_tool(&fixture, "node", &["-e", script]);
+        // Qualification may select a hash-recorded command host outside
+        // private user directories (e.g. a machine installation). Never
+        // treat an inaccessible user-level nvm link as a containment pass.
+        let node = std::env::var("LS_SANDBOX_TEST_NODE").unwrap_or_else(|_| "node".to_string());
+        let output = run_tool(&fixture, &node, &["-e", script]);
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -1137,7 +1151,28 @@ mod containment_matrix {
             String::from_utf8_lossy(&init.stderr)
         );
         let status = run_tool(&fixture, "git", &["status", "--porcelain"]);
-        assert_eq!(status.status.code(), Some(0));
+        assert_eq!(
+            status.status.code(),
+            Some(0),
+            "git status must run after init: {status:?}"
+        );
+        let head = fixture.workspace.join(".git").join("HEAD");
+        let before = std::fs::read(&head).unwrap();
+        let code = format!(
+            "import sys\nprint('GIT-PROTECT-START', flush=True)\ntry:\n open(r'{}', 'ab').write(b'not-allowed')\nexcept PermissionError:\n print('GIT-PROTECT-DENIED', flush=True)\n sys.exit(23)\nsys.exit(0)",
+            head.display()
+        );
+        let write = run_tool(&fixture, "python", &["-c", &code]);
+        assert_eq!(
+            write.status.code(),
+            Some(23),
+            "new Git metadata must remain protected: {write:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&write.stdout).replace("\r\n", "\n"),
+            "GIT-PROTECT-START\nGIT-PROTECT-DENIED\n"
+        );
+        assert_eq!(std::fs::read(&head).unwrap(), before);
     }
 
     #[test]
@@ -1181,19 +1216,94 @@ mod containment_matrix {
     }
 
     #[test]
-    fn external_read_canary_is_denied() {
+    fn external_public_read_matches_workspace_write_policy() {
         let fixture = Fixture::new();
+        assert_eq!(std::fs::read(&fixture.external_file).unwrap(), b"original");
         let victim = fixture.external_file.to_string_lossy().to_string();
+        let nonce = fixture
+            .workspace
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         let code = format!(
-            "import sys; data = open(r'{victim}', 'rb').read(); sys.exit(0 if data == b'original' else 3)"
+            "import sys; print('START-{nonce}', flush=True); data = open(r'{victim}', 'rb').read(); print('READ-{nonce}' if data == b'original' else 'WRONG'); sys.exit(0 if data == b'original' else 3)"
+        );
+        let expected = format!("START-{nonce}\nREAD-{nonce}\n");
+        let host = Command::new("python").args(["-c", &code]).output().unwrap();
+        assert_eq!(
+            host.status.code(),
+            Some(0),
+            "host Python baseline: {host:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&host.stdout).replace("\r\n", "\n"),
+            expected
         );
         let read = run_tool(&fixture, "python", &["-c", &code]);
-        assert_ne!(
+        assert_eq!(
             read.status.code(),
             Some(0),
-            "external read canary must be denied; stdout: {} stderr: {}",
-            String::from_utf8_lossy(&read.stdout),
-            String::from_utf8_lossy(&read.stderr)
+            "ordinary external read: {read:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&read.stdout).replace("\r\n", "\n"),
+            expected
+        );
+    }
+
+    #[test]
+    fn external_sensitive_ssh_canary_is_denied() {
+        use std::io::Write;
+
+        // Only a new synthetic file is accessed; never read real SSH keys.
+        // setup.rs explicitly excludes .ssh from profile read grants.
+        let ssh_root = PathBuf::from(std::env::var_os("USERPROFILE").unwrap()).join(".ssh");
+        assert!(
+            ssh_root.is_dir(),
+            "qualification requires an existing .ssh directory"
+        );
+        let mut canary = tempfile::Builder::new()
+            .prefix("ls-d7-canary-")
+            .tempfile_in(&ssh_root)
+            .unwrap();
+        canary.write_all(b"synthetic-d7-canary").unwrap();
+        canary.flush().unwrap();
+        assert_eq!(
+            std::fs::read(canary.path()).unwrap(),
+            b"synthetic-d7-canary"
+        );
+        let victim = dunce::canonicalize(canary.path()).unwrap();
+        let nonce = victim.file_name().unwrap().to_string_lossy();
+        let victim_text = victim.to_string_lossy();
+        let code = format!(
+            "import sys\nprint('START-{nonce}', flush=True)\ntry:\n data = open(r'{victim_text}', 'rb').read()\nexcept PermissionError:\n print('DENIED-{nonce}', flush=True)\n sys.exit(23)\nprint('READ-{nonce}' if data == b'synthetic-d7-canary' else 'WRONG', flush=True)\nsys.exit(0 if data == b'synthetic-d7-canary' else 3)"
+        );
+        let host = Command::new("python").args(["-c", &code]).output().unwrap();
+        assert_eq!(
+            host.status.code(),
+            Some(0),
+            "host canary baseline: {host:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&host.stdout).replace("\r\n", "\n"),
+            format!("START-{nonce}\nREAD-{nonce}\n")
+        );
+        let fixture = Fixture::new();
+        let read = run_tool(&fixture, "python", &["-c", &code]);
+        assert_eq!(
+            read.status.code(),
+            Some(23),
+            "must be interpreter PermissionError, not runner failure: {read:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&read.stdout).replace("\r\n", "\n"),
+            format!("START-{nonce}\nDENIED-{nonce}\n")
+        );
+        assert_eq!(
+            std::fs::read(canary.path()).unwrap(),
+            b"synthetic-d7-canary"
         );
     }
 

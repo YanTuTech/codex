@@ -206,3 +206,17 @@ fn grant_allow_ace(path: &std::path::Path, sid: &[u8]) {
         assert_eq!(set, 0, "SetNamedSecurityInfoW failed: {set}");
     }
 }
+
+#[test]
+fn missing_recorded_acl_roots_are_already_absent() {
+    let temp = tempfile::tempdir().expect("temporary root");
+    let sid = resolve_sid("Everyone").expect("test trustee");
+    for path in [
+        temp.path().join("missing"),
+        temp.path().join("missing").join("child"),
+    ] {
+        assert!(
+            !remove_group_allow_aces(&path, &sid).expect("an absent object has no ACE to remove")
+        );
+    }
+}

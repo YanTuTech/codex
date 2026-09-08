@@ -72,6 +72,12 @@ mod helper_materialization;
 #[cfg(target_os = "windows")]
 mod hide_users;
 #[cfg(target_os = "windows")]
+mod ls_logon_cleanup;
+#[cfg(target_os = "windows")]
+pub use ls_logon_cleanup::installation_logon_entries_present;
+#[cfg(target_os = "windows")]
+pub use ls_logon_cleanup::remove_installation_logon_entries;
+#[cfg(target_os = "windows")]
 mod identity;
 #[cfg(target_os = "windows")]
 mod logging;
@@ -141,6 +147,8 @@ pub(crate) use elevated::runner_pipe;
 pub use acl::add_deny_read_ace;
 #[cfg(target_os = "windows")]
 pub use acl::add_deny_write_ace;
+#[cfg(target_os = "windows")]
+pub use acl::add_deny_write_ace_to_handle;
 
 #[cfg(target_os = "windows")]
 pub use acl::allow_null_device;

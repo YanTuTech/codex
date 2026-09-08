@@ -22,10 +22,14 @@ struct FakeEffects {
     sid: Option<Vec<u8>>,
     acl_failures: Vec<String>,
     firewall_removed: bool,
+    firewall_attempts: usize,
     firewall_still_present: Vec<String>,
     wfp_removed: bool,
+    wfp_attempts: usize,
     wfp_still_present: Vec<String>,
     accounts_removed: bool,
+    account_attempts: usize,
+    recover_on_delete: bool,
     accounts_still_present: Vec<String>,
     deleted_files: Vec<String>,
     persisted_installation_id: Option<String>,
@@ -44,18 +48,30 @@ impl UninstallEffects for FakeEffects {
     }
     fn remove_firewall_rules(&mut self, _identity: &SandboxInstallationIdentity) {
         self.firewall_removed = true;
+        self.firewall_attempts += 1;
+        if self.recover_on_delete {
+            self.firewall_still_present.clear();
+        }
     }
     fn firewall_rules_present(&self, _identity: &SandboxInstallationIdentity) -> Vec<String> {
         self.firewall_still_present.clone()
     }
     fn remove_wfp_objects(&mut self, _identity: &SandboxInstallationIdentity) {
         self.wfp_removed = true;
+        self.wfp_attempts += 1;
+        if self.recover_on_delete {
+            self.wfp_still_present.clear();
+        }
     }
     fn wfp_objects_present(&self, _identity: &SandboxInstallationIdentity) -> Vec<String> {
         self.wfp_still_present.clone()
     }
     fn remove_accounts(&mut self, _identity: &SandboxInstallationIdentity) {
         self.accounts_removed = true;
+        self.account_attempts += 1;
+        if self.recover_on_delete {
+            self.accounts_still_present.clear();
+        }
     }
     fn accounts_present(&self, _identity: &SandboxInstallationIdentity) -> Vec<String> {
         self.accounts_still_present.clone()
@@ -168,8 +184,9 @@ fn wfp_removal_failure_keeps_state_and_is_retryable() {
     let result = harness.run();
     let failures = result.expect_err("unproven absence must fail");
     assert!(
-        failures.iter().any(|f| f.phase == "verified-absent"
-            && f.detail.contains("WFP objects still present")),
+        failures
+            .iter()
+            .any(|f| f.phase == "wfp-removed" && f.detail.contains("WFP objects still present")),
         "failures: {failures:?}"
     );
     // Non-zero exit is represented by the Err; the state files survive.
@@ -180,7 +197,7 @@ fn wfp_removal_failure_keeps_state_and_is_retryable() {
     assert!(
         matches!(
             harness.journal_phase(),
-            Some(UninstallPhase::AccountsRemoved)
+            Some(UninstallPhase::FirewallRemoved)
         ),
         "journal records the last completed phase, got {:?}",
         harness.journal_phase()
@@ -210,16 +227,13 @@ fn firewall_removal_failure_keeps_state() {
     );
     assert!(harness.effects.deleted_files.is_empty());
     assert!(
-        matches!(
-            harness.journal_phase(),
-            Some(UninstallPhase::AccountsRemoved)
-        ),
-        "later phases still ran and journalled"
+        matches!(harness.journal_phase(), Some(UninstallPhase::AclRemoved)),
+        "failed removal must not advance the checkpoint"
     );
 }
 
 #[test]
-fn acl_failure_is_reported_but_later_phases_still_run() {
+fn acl_failure_preserves_later_resources_for_exact_retry() {
     let mut harness = Harness::new();
     harness.effects.roots = vec![PathBuf::from(r"C:\ws\locked-root")];
     harness.effects.acl_failures = vec![r"C:\ws\locked-root".to_string()];
@@ -230,10 +244,10 @@ fn acl_failure_is_reported_but_later_phases_still_run() {
             .any(|f| f.phase == "acl-removed" && f.detail.contains("locked-root")),
         "failures: {failures:?}"
     );
-    // The remaining families still executed (collect-all-failures semantics).
-    assert!(harness.effects.firewall_removed);
-    assert!(harness.effects.wfp_removed);
-    assert!(harness.effects.accounts_removed);
+    // Keep the trustee and confinement resources until ACL recovery.
+    assert!(!harness.effects.firewall_removed);
+    assert!(!harness.effects.wfp_removed);
+    assert!(!harness.effects.accounts_removed);
     assert!(harness.effects.deleted_files.is_empty());
 }
 
@@ -347,4 +361,100 @@ fn a_swapped_ownership_record_fails_closed_on_resume() {
         "failures: {failures:?}"
     );
     assert!(harness.effects.deleted_files.is_empty());
+}
+
+#[test]
+fn cleanup_journal_persists_rfc3339_and_replaces_atomically() {
+    let temp = tempfile::tempdir().expect("journal directory");
+    let mut io = super::FileCleanupJournalIo {
+        sandbox_dir: temp.path().to_path_buf(),
+    };
+    let mut journal = CleanupJournal {
+        version: super::uninstall_state_machine::CLEANUP_JOURNAL_VERSION,
+        install_id: SandboxInstallationIdentity::generate().install_id_hex(),
+        ownership_digest: Some("a".repeat(64)),
+        completed_phase: UninstallPhase::Pending,
+        updated_at: "2026-09-08T01:55:39.8145343+08:00".to_string(),
+    };
+    io.write_journal(&journal)
+        .expect("RFC3339 timestamp is payload, not a filename");
+    assert_eq!(io.read_journal(), Some(journal.clone()));
+    journal.completed_phase = UninstallPhase::AclRemoved;
+    io.write_journal(&journal)
+        .expect("replace the existing journal");
+    assert_eq!(io.read_journal(), Some(journal));
+    assert_eq!(
+        std::fs::read_dir(temp.path())
+            .expect("list journal directory")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn acl_failure_does_not_advance_or_destroy_retry_identity() {
+    let mut harness = Harness::new();
+    harness.effects.roots = vec![PathBuf::from(r"C:\ws\locked-root")];
+    harness.effects.acl_failures = vec!["locked-root".to_string()];
+    harness
+        .run()
+        .expect_err("ACL failure must preserve the trustee for retry");
+    assert!(!harness.effects.accounts_removed);
+    assert_eq!(harness.journal_phase(), Some(UninstallPhase::Pending));
+    harness.effects.acl_failures = vec!["locked-root".to_string()];
+    harness
+        .run()
+        .expect_err("retry must attempt ACL removal again");
+    assert!(!harness.effects.accounts_removed);
+    harness.run().expect("retry after ACL recovery succeeds");
+    assert!(harness.effects.accounts_removed);
+    assert!(harness.journal_phase().is_none());
+}
+
+#[test]
+fn native_account_absence_query_does_not_crash() {
+    // This random identity is never provisioned. The real local Net APIs
+    // must report absence without creating or deleting any account/group.
+    let identity = SandboxInstallationIdentity::generate();
+    assert!(super::sandbox_users::accounts_present(&identity).is_empty());
+}
+
+#[test]
+fn resource_removal_is_retried_after_a_failed_attempt() {
+    for family in ["firewall", "wfp", "accounts"] {
+        let mut harness = Harness::new();
+        match family {
+            "firewall" => harness
+                .effects
+                .firewall_still_present
+                .push("rule".to_string()),
+            "wfp" => harness.effects.wfp_still_present.push("filter".to_string()),
+            "accounts" => harness
+                .effects
+                .accounts_still_present
+                .push("account".to_string()),
+            _ => unreachable!(),
+        }
+        harness
+            .run()
+            .expect_err("failed removal must keep recovery state");
+        // Exercise compatibility with an older checkpoint that advanced
+        // despite a surviving resource. Only a fresh deletion clears it.
+        harness
+            .journal
+            .inner
+            .borrow_mut()
+            .as_mut()
+            .expect("journal")
+            .completed_phase = UninstallPhase::AccountsRemoved;
+        harness.effects.recover_on_delete = true;
+        harness.run().expect("retry after the transient failure");
+        let attempts = match family {
+            "firewall" => harness.effects.firewall_attempts,
+            "wfp" => harness.effects.wfp_attempts,
+            "accounts" => harness.effects.account_attempts,
+            _ => unreachable!(),
+        };
+        assert_eq!(attempts, 2, "retry must invoke {family} deletion again");
+    }
 }

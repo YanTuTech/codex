@@ -11,6 +11,8 @@ use std::ffi::c_void;
 use std::path::Path;
 
 use anyhow::Result;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::ACL;
@@ -60,6 +62,12 @@ pub fn remove_group_allow_aces(path: &Path, group_sid: &[u8]) -> Result<bool> {
             std::ptr::null_mut(),
             &mut sd,
         );
+        // Managed command temp roots normally disappear before uninstall.
+        // Only explicit Win32 not-found codes prove absence; permission and
+        // all other query failures still fail closed below.
+        if result == ERROR_FILE_NOT_FOUND || result == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
         if result != ERROR_SUCCESS {
             anyhow::bail!("GetNamedSecurityInfoW({}) failed: {result}", path.display());
         }

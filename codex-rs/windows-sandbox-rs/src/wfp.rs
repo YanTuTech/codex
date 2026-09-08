@@ -1,4 +1,8 @@
 mod filter_specs;
+mod ls_user_condition;
+use ls_user_condition::condition_user_sid;
+mod ls_readback_security;
+use ls_readback_security::LsReadbackSecurity;
 
 use crate::to_wide;
 use anyhow::Result;
@@ -9,6 +13,8 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::FWP_E_ALREADY_EXISTS;
 use windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND;
 use windows_sys::Win32::Foundation::FWP_E_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND;
+use windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::LocalFree;
@@ -55,10 +61,8 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransac
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::FwpmTransactionCommit0;
 use windows_sys::Win32::Security::Authorization::BuildExplicitAccessWithNameW;
 use windows_sys::Win32::Security::Authorization::BuildSecurityDescriptorW;
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
-use windows_sys::Win32::Security::GetSecurityDescriptorOwner;
 use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -88,23 +92,55 @@ pub fn install_wfp_filters_for_installation(
     codex_home: &std::path::Path,
     identity: &SandboxInstallationIdentity,
     account: &str,
+    readback_user: &str,
 ) -> Result<usize> {
     let record = load_or_allocate_wfp_ownership(codex_home, identity, &filter_spec_names())?;
-    install_wfp_filters_with_record(&record, account)
+    install_wfp_filters_with_record(&record, account, readback_user)
 }
 
-fn install_wfp_filters_with_record(record: &WfpOwnershipRecord, account: &str) -> Result<usize> {
+fn install_wfp_filters_with_record(
+    record: &WfpOwnershipRecord,
+    account: &str,
+    readback_user: &str,
+) -> Result<usize> {
+    let security = LsReadbackSecurity::for_reader(readback_user)?;
     let engine = Engine::open(record)?;
     let mut transaction = engine.begin_transaction()?;
-    ensure_provider(engine.handle, record)?;
-    ensure_sublayer(engine.handle, record)?;
+    // Recreate only recorded objects atomically, including on upgrade,
+    // so an older default DACL cannot leave Host read-back inaccessible.
+    for name in record.filter_keys.keys() {
+        delete_filter_if_present(
+            engine.handle,
+            &GUID::from_u128(record.filter_key_u128(name)?),
+        )?;
+    }
+    let sublayer = GUID::from_u128(record.sublayer_key_u128()?);
+    let provider = GUID::from_u128(record.provider_key_u128()?);
+    ensure_success_or(
+        unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &sublayer) },
+        "FwpmSubLayerDeleteByKey0",
+        &[FWP_E_NOT_FOUND as u32, FWP_E_SUBLAYER_NOT_FOUND as u32],
+    )?;
+    ensure_success_or(
+        unsafe { FwpmProviderDeleteByKey0(engine.handle, &provider) },
+        "FwpmProviderDeleteByKey0",
+        &[FWP_E_NOT_FOUND as u32, FWP_E_PROVIDER_NOT_FOUND as u32],
+    )?;
+    ensure_provider(engine.handle, record, security.descriptor)?;
+    ensure_sublayer(engine.handle, record, security.descriptor)?;
 
     let user_condition = UserMatchCondition::for_account(account)?;
     let mut installed_filter_count = 0;
     for spec in FILTER_SPECS {
         let filter_key = GUID::from_u128(record.filter_key_u128(spec.name)?);
-        delete_filter_if_present(engine.handle, &filter_key)?;
-        add_filter(engine.handle, spec, &filter_key, record, &user_condition)?;
+        add_filter(
+            engine.handle,
+            spec,
+            &filter_key,
+            record,
+            &user_condition,
+            security.descriptor,
+        )?;
         installed_filter_count += 1;
     }
 
@@ -121,10 +157,15 @@ pub fn wfp_objects_present(
     codex_home: &std::path::Path,
     identity: &SandboxInstallationIdentity,
 ) -> Vec<String> {
-    let Some(record) =
-        crate::wfp_ownership::load_wfp_ownership(codex_home, identity).unwrap_or(None)
-    else {
-        return Vec::new();
+    let record = match crate::wfp_ownership::load_wfp_ownership(codex_home, identity) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return match std::fs::metadata(crate::wfp_ownership::wfp_ownership_path(codex_home)) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                _ => vec!["ownership:foreign-or-unverifiable".to_string()],
+            };
+        }
+        Err(_) => return vec!["ownership:query-failed".to_string()],
     };
     let mut present = Vec::new();
     let engine = match Engine::open(&record) {
@@ -135,28 +176,61 @@ pub fn wfp_objects_present(
             return present;
         }
     };
-    for spec in FILTER_SPECS {
-        if let Ok(key) = record.filter_key_u128(spec.name) {
+    for name in record.filter_keys.keys() {
+        if let Ok(key) = record.filter_key_u128(name) {
             let guid = GUID::from_u128(key);
-            let result = unsafe { FwpmFilterGetByKey0(engine.handle, &guid, std::ptr::null_mut()) };
+            let result = {
+                let mut object: *mut FWPM_FILTER0 = null_mut();
+                let status = unsafe { FwpmFilterGetByKey0(engine.handle, &guid, &mut object) };
+                if !object.is_null() {
+                    unsafe {
+                        FwpmFreeMemory0(&mut object as *mut _ as *mut _);
+                    }
+                }
+                status
+            };
             if result != FWP_E_NOT_FOUND as u32 && result != FWP_E_FILTER_NOT_FOUND as u32 {
-                present.push(format!("filter:{}", spec.name));
+                present.push(format!("filter:{name}"));
             }
+        } else {
+            present.push(format!("filter:{name}:invalid-key"));
         }
     }
     if let Ok(key) = record.sublayer_key_u128() {
         let guid = GUID::from_u128(key);
-        let result = unsafe { FwpmSubLayerGetByKey0(engine.handle, &guid, std::ptr::null_mut()) };
-        if result != FWP_E_NOT_FOUND as u32 {
+        let result = {
+            let mut object: *mut FWPM_SUBLAYER0 = null_mut();
+            let status = unsafe { FwpmSubLayerGetByKey0(engine.handle, &guid, &mut object) };
+            if !object.is_null() {
+                unsafe {
+                    FwpmFreeMemory0(&mut object as *mut _ as *mut _);
+                }
+            }
+            status
+        };
+        if result != FWP_E_NOT_FOUND as u32 && result != FWP_E_SUBLAYER_NOT_FOUND as u32 {
             present.push("sublayer".to_string());
         }
+    } else {
+        present.push("sublayer:invalid-key".to_string());
     }
     if let Ok(key) = record.provider_key_u128() {
         let guid = GUID::from_u128(key);
-        let result = unsafe { FwpmProviderGetByKey0(engine.handle, &guid, std::ptr::null_mut()) };
-        if result != FWP_E_NOT_FOUND as u32 {
+        let result = {
+            let mut object: *mut FWPM_PROVIDER0 = null_mut();
+            let status = unsafe { FwpmProviderGetByKey0(engine.handle, &guid, &mut object) };
+            if !object.is_null() {
+                unsafe {
+                    FwpmFreeMemory0(&mut object as *mut _ as *mut _);
+                }
+            }
+            status
+        };
+        if result != FWP_E_NOT_FOUND as u32 && result != FWP_E_PROVIDER_NOT_FOUND as u32 {
             present.push("provider".to_string());
         }
+    } else {
+        present.push("provider:invalid-key".to_string());
     }
     present
 }
@@ -220,18 +294,38 @@ pub fn read_live_filter_facts(
     let engine = Engine::open(&record)?;
     // Provider and sublayer must be live before any filter can be.
     let sublayer_guid = GUID::from_u128(record.sublayer_key_u128()?);
-    let sublayer_result =
-        unsafe { FwpmSubLayerGetByKey0(engine.handle, &sublayer_guid, std::ptr::null_mut()) };
-    if sublayer_result == FWP_E_NOT_FOUND as u32 {
+    let sublayer_result = {
+        let mut object: *mut FWPM_SUBLAYER0 = null_mut();
+        let status = unsafe { FwpmSubLayerGetByKey0(engine.handle, &sublayer_guid, &mut object) };
+        if !object.is_null() {
+            unsafe {
+                FwpmFreeMemory0(&mut object as *mut _ as *mut _);
+            }
+        }
+        status
+    };
+    if sublayer_result == FWP_E_NOT_FOUND as u32
+        || sublayer_result == FWP_E_SUBLAYER_NOT_FOUND as u32
+    {
         anyhow::bail!("live WFP sublayer is absent from the engine");
     }
     if sublayer_result != 0 {
         anyhow::bail!("live WFP sublayer query failed with {sublayer_result:#x}");
     }
     let provider_guid = GUID::from_u128(record.provider_key_u128()?);
-    let provider_result =
-        unsafe { FwpmProviderGetByKey0(engine.handle, &provider_guid, std::ptr::null_mut()) };
-    if provider_result == FWP_E_NOT_FOUND as u32 {
+    let provider_result = {
+        let mut object: *mut FWPM_PROVIDER0 = null_mut();
+        let status = unsafe { FwpmProviderGetByKey0(engine.handle, &provider_guid, &mut object) };
+        if !object.is_null() {
+            unsafe {
+                FwpmFreeMemory0(&mut object as *mut _ as *mut _);
+            }
+        }
+        status
+    };
+    if provider_result == FWP_E_NOT_FOUND as u32
+        || provider_result == FWP_E_PROVIDER_NOT_FOUND as u32
+    {
         anyhow::bail!("live WFP provider is absent from the engine");
     }
     if provider_result != 0 {
@@ -260,6 +354,9 @@ pub fn read_live_filter_facts(
                 if filter_ref.action.r#type != FWP_ACTION_BLOCK {
                     anyhow::bail!("live WFP filter {} is not a BLOCK filter", spec.name);
                 }
+                if filter_ref.numFilterConditions == 0 || filter_ref.filterCondition.is_null() {
+                    anyhow::bail!("live WFP filter has no conditions");
+                }
                 let conditions = std::slice::from_raw_parts(
                     filter_ref.filterCondition,
                     filter_ref.numFilterConditions as usize,
@@ -273,11 +370,23 @@ pub fn read_live_filter_facts(
                             spec.name
                         ))
                     })?;
+                if conditions
+                    .iter()
+                    .filter(|c| guid_eq(&c.fieldKey, &FWPM_CONDITION_ALE_USER_ID))
+                    .count()
+                    != 1
+                    || user.matchType != FWP_MATCH_EQUAL
+                {
+                    anyhow::bail!("user condition must be a single equality match");
+                }
                 if user.conditionValue.r#type != FWP_SECURITY_DESCRIPTOR_TYPE {
                     anyhow::bail!(
                         "live WFP filter {} user condition has an unexpected value type",
                         spec.name
                     );
+                }
+                if user.conditionValue.Anonymous.sd.is_null() {
+                    anyhow::bail!("missing user descriptor blob");
                 }
                 let blob = &*user.conditionValue.Anonymous.sd;
                 if blob.size == 0 || blob.data.is_null() {
@@ -286,29 +395,7 @@ pub fn read_live_filter_facts(
                         spec.name
                     );
                 }
-                let mut owner: *mut core::ffi::c_void = null_mut();
-                let mut owner_defaulted: i32 = 0;
-                if GetSecurityDescriptorOwner(
-                    blob.data as PSECURITY_DESCRIPTOR,
-                    &mut owner,
-                    &mut owner_defaulted,
-                ) == 0
-                    || owner.is_null()
-                {
-                    anyhow::bail!(
-                        "live WFP filter {} user condition has no descriptor owner",
-                        spec.name
-                    );
-                }
-                let mut textual: *mut u16 = null_mut();
-                if ConvertSidToStringSidW(owner, &mut textual) == 0 || textual.is_null() {
-                    anyhow::bail!(
-                        "live WFP filter {} user SID could not be rendered",
-                        spec.name
-                    );
-                }
-                let sid = pwstr_to_string(textual);
-                LocalFree(textual as HLOCAL);
+                let sid = condition_user_sid(blob)?;
                 if sid != expected_user_sid {
                     anyhow::bail!(
                         "live WFP filter {} constrains a different user than {}",
@@ -333,7 +420,7 @@ pub fn read_live_filter_facts(
 /// Removes exactly the WFP objects recorded in this installation's ownership
 /// record. Objects owned by other installations (including Codex-global
 /// provider/sublayer keys) are never addressed. Deletes the ownership record
-/// afterwards; a missing record means there is nothing owned to remove.
+/// only when the uninstall coordinator finishes; missing records have no keys to remove.
 pub fn remove_wfp_objects_for_installation(
     codex_home: &std::path::Path,
     identity: &SandboxInstallationIdentity,
@@ -346,16 +433,15 @@ pub fn remove_wfp_objects_for_installation(
     let engine = Engine::open(&record)?;
     {
         let mut transaction = engine.begin_transaction()?;
-        for spec in FILTER_SPECS {
-            if let Ok(key) = record.filter_key_u128(spec.name) {
-                delete_filter_if_present(engine.handle, &GUID::from_u128(key))?;
-            }
+        for name in record.filter_keys.keys() {
+            let key = record.filter_key_u128(name)?;
+            delete_filter_if_present(engine.handle, &GUID::from_u128(key))?;
         }
         let sublayer_key = GUID::from_u128(record.sublayer_key_u128()?);
         let sublayer_result = unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &sublayer_key) };
         if sublayer_result != 0
             && sublayer_result != FWP_E_NOT_FOUND as u32
-            && sublayer_result != FWP_E_FILTER_NOT_FOUND as u32
+            && sublayer_result != FWP_E_SUBLAYER_NOT_FOUND as u32
         {
             // Abort the transaction: committing after a failed delete would
             // erase the only cleanup manifest while WFP objects remain.
@@ -365,7 +451,10 @@ pub fn remove_wfp_objects_for_installation(
         }
         let provider_key = GUID::from_u128(record.provider_key_u128()?);
         let provider_result = unsafe { FwpmProviderDeleteByKey0(engine.handle, &provider_key) };
-        if provider_result != 0 && provider_result != FWP_E_NOT_FOUND as u32 {
+        if provider_result != 0
+            && provider_result != FWP_E_NOT_FOUND as u32
+            && provider_result != FWP_E_PROVIDER_NOT_FOUND as u32
+        {
             return Err(anyhow::Error::msg(format!(
                 "FwpmProviderDeleteByKey0 failed with {provider_result}; ownership record retained"
             )));
@@ -373,8 +462,9 @@ pub fn remove_wfp_objects_for_installation(
         transaction.commit()?;
     }
     drop(engine);
-    crate::wfp_ownership::delete_wfp_ownership(codex_home)?;
-    log("WFP ownership record deleted");
+    // The uninstall coordinator deletes this record only AFTER live
+    // absence checks and every other resource family have completed.
+    log("WFP objects removed; ownership retained for final verification");
     Ok(())
 }
 
@@ -512,7 +602,11 @@ impl Drop for UserMatchCondition {
 }
 
 /// Ensures the persistent, installation-scoped WFP provider exists.
-fn ensure_provider(engine: HANDLE, record: &WfpOwnershipRecord) -> Result<()> {
+fn ensure_provider(
+    engine: HANDLE,
+    record: &WfpOwnershipRecord,
+    security: PSECURITY_DESCRIPTOR,
+) -> Result<()> {
     let provider_name = format!(
         "LeapSea Windows Sandbox WFP (install {})",
         &record.install_id[..8.min(record.install_id.len())]
@@ -534,13 +628,17 @@ fn ensure_provider(engine: HANDLE, record: &WfpOwnershipRecord) -> Result<()> {
         serviceName: null_mut(),
     };
 
-    let result = unsafe { FwpmProviderAdd0(engine, &provider, null_mut()) };
+    let result = unsafe { FwpmProviderAdd0(engine, &provider, security) };
     ensure_success_or(result, "FwpmProviderAdd0", &[FWP_E_ALREADY_EXISTS as u32])
 }
 
 /// Ensures the persistent, installation-scoped sublayer exists under this
 /// installation's provider.
-fn ensure_sublayer(engine: HANDLE, record: &WfpOwnershipRecord) -> Result<()> {
+fn ensure_sublayer(
+    engine: HANDLE,
+    record: &WfpOwnershipRecord,
+    security: PSECURITY_DESCRIPTOR,
+) -> Result<()> {
     let sublayer_name = format!(
         "LeapSea Windows Sandbox Sublayer (install {})",
         &record.install_id[..8.min(record.install_id.len())]
@@ -564,7 +662,7 @@ fn ensure_sublayer(engine: HANDLE, record: &WfpOwnershipRecord) -> Result<()> {
         weight: 0x8000,
     };
 
-    let result = unsafe { FwpmSubLayerAdd0(engine, &sublayer, null_mut()) };
+    let result = unsafe { FwpmSubLayerAdd0(engine, &sublayer, security) };
     ensure_success_or(result, "FwpmSubLayerAdd0", &[FWP_E_ALREADY_EXISTS as u32])
 }
 
@@ -576,6 +674,7 @@ fn add_filter(
     filter_key: &GUID,
     record: &WfpOwnershipRecord,
     user_condition: &UserMatchCondition,
+    security: PSECURITY_DESCRIPTOR,
 ) -> Result<()> {
     let filter_name = format!("ls_wfp_{}_{}", &record.install_id[..8], spec.name);
     let filter_name = to_wide(OsStr::new(&filter_name));
@@ -609,7 +708,7 @@ fn add_filter(
     };
 
     let mut filter_id = 0_u64;
-    let result = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
+    let result = unsafe { FwpmFilterAdd0(engine, &filter, security, &mut filter_id) };
     ensure_success(result, &format!("FwpmFilterAdd0({})", spec.name))
 }
 
@@ -731,6 +830,50 @@ mod tests {
             .values()
             .all(|hex| !record.filter_keys.values().any(|existing| existing == hex));
         assert!(disjoint, "two installations must not share filter keys");
+    }
+
+    #[test]
+    fn condition_sid_comes_from_the_matching_trustee() {
+        let condition = super::UserMatchCondition::for_account("Everyone").expect("test condition");
+        assert_eq!(
+            super::condition_user_sid(&condition.blob).expect("read match trustee"),
+            "S-1-1-0"
+        );
+    }
+
+    #[test]
+    fn native_unregistered_wfp_keys_are_absent() {
+        let dir = tempfile::tempdir().expect("local test record");
+        let identity = crate::installation::SandboxInstallationIdentity::generate();
+        crate::wfp_ownership::load_or_allocate_wfp_ownership(
+            dir.path(),
+            &identity,
+            &super::filter_spec_names(),
+        )
+        .expect("unregistered random keys");
+        // Read-only BFE calls: no filter, provider, or account is created.
+        assert_eq!(
+            super::wfp_objects_present(dir.path(), &identity),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn corrupt_wfp_ownership_is_not_absence() {
+        let dir = tempfile::tempdir().expect("local test record");
+        let identity = crate::installation::SandboxInstallationIdentity::generate();
+        crate::wfp_ownership::load_or_allocate_wfp_ownership(
+            dir.path(),
+            &identity,
+            &super::filter_spec_names(),
+        )
+        .expect("allocate record");
+        std::fs::write(
+            crate::wfp_ownership::wfp_ownership_path(dir.path()),
+            b"{broken",
+        )
+        .expect("corrupt only test data");
+        assert!(!super::wfp_objects_present(dir.path(), &identity).is_empty());
     }
 
     #[test]

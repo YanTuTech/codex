@@ -18,6 +18,8 @@ use windows_sys::Win32::Foundation::NTSTATUS;
 use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
 use windows_sys::Win32::Foundation::UNICODE_STRING;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
@@ -67,6 +69,33 @@ unsafe extern "system" {
 /// The returned handle must remain open through any security mutation so the
 /// mutation stays bound to the directory that passed this validation.
 pub(super) fn open_or_create_no_reparse(path: &Path) -> Result<OwnedHandle> {
+    open_no_reparse(
+        path,
+        READ_CONTROL | WRITE_DAC,
+        FILE_OPEN_IF,
+        FILE_DIRECTORY_FILE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+/// Pins an existing object without traversing reparse points or sharing delete.
+pub(super) fn open_existing_no_reparse(path: &Path, access: u32) -> Result<OwnedHandle> {
+    open_no_reparse(
+        path,
+        access | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        1,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+}
+
+fn open_no_reparse(
+    path: &Path,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    share: u32,
+) -> Result<OwnedHandle> {
     ensure!(
         path.is_absolute(),
         "sandbox ACL path must be absolute: {}",
@@ -119,14 +148,14 @@ pub(super) fn open_or_create_no_reparse(path: &Path) -> Result<OwnedHandle> {
         // SetSecurityInfo can reject a WRITE_DAC-only directory handle.
         NtCreateFile(
             &mut handle,
-            READ_CONTROL | WRITE_DAC,
+            access,
             &object_attributes,
             &mut io_status_block,
             ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN_IF,
-            FILE_DIRECTORY_FILE,
+            share,
+            disposition,
+            options,
             ptr::null(),
             /*ea_length*/ 0,
         )

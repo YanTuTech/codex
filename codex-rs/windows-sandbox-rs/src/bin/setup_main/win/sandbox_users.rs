@@ -21,6 +21,7 @@ use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_MEMBERS_INF
 use windows_sys::Win32::NetworkManagement::NetManagement::NERR_GroupNotFound;
 use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
 use windows_sys::Win32::NetworkManagement::NetManagement::NERR_UserNotFound;
+use windows_sys::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAdd;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAddMembers;
 use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupDel;
@@ -121,8 +122,15 @@ pub fn accounts_present(identity: &SandboxInstallationIdentity) -> Vec<String> {
     let mut present = Vec::new();
     for username in [identity.offline_username(), identity.online_username()] {
         let wide = to_wide(OsStr::new(&username));
-        let status =
-            unsafe { NetUserGetInfo(std::ptr::null(), wide.as_ptr(), 0, std::ptr::null_mut()) };
+        // bufptr is a required OUT pointer even when the account is absent.
+        // Passing NULL crashes SAMCLI instead of returning a not-found code.
+        let mut buffer = std::ptr::null_mut();
+        let status = unsafe { NetUserGetInfo(std::ptr::null(), wide.as_ptr(), 0, &mut buffer) };
+        if !buffer.is_null() {
+            unsafe {
+                NetApiBufferFree(buffer.cast());
+            }
+        }
         if status != NERR_UserNotFound {
             // Any other status (success or query failure) claims presence so
             // absence can never rest on a broken query.
@@ -131,11 +139,19 @@ pub fn accounts_present(identity: &SandboxInstallationIdentity) -> Vec<String> {
     }
     let group = identity.sandbox_group_name();
     let wide = to_wide(OsStr::new(&group));
-    let status =
-        unsafe { NetLocalGroupGetInfo(std::ptr::null(), wide.as_ptr(), 0, std::ptr::null_mut()) };
+    let mut buffer = std::ptr::null_mut();
+    let status = unsafe { NetLocalGroupGetInfo(std::ptr::null(), wide.as_ptr(), 0, &mut buffer) };
+    if !buffer.is_null() {
+        unsafe {
+            NetApiBufferFree(buffer.cast());
+        }
+    }
     if status != NERR_GroupNotFound {
         present.push(group);
     }
+    present.extend(codex_windows_sandbox::installation_logon_entries_present(
+        identity,
+    ));
     present
 }
 
@@ -171,12 +187,13 @@ pub fn remove_sandbox_users(
             &format!("NetLocalGroupDel failed for {group_name} code {status}; continuing"),
         )?;
     }
+    codex_windows_sandbox::remove_installation_logon_entries(identity)?;
     Ok(())
 }
 
 /// Reads the persisted secrets file when it matches this installation's
 /// derived account names and decrypts cleanly; returns the two passwords.
-fn read_persisted_secrets_if_matching(
+pub(super) fn read_persisted_secrets_if_matching(
     codex_home: &Path,
     offline_username: &str,
     online_username: &str,

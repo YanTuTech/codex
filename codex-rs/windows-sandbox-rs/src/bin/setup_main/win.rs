@@ -1,4 +1,5 @@
 mod firewall;
+mod ls_owned_acl;
 mod no_reparse_dir;
 mod read_acl_mutex;
 
@@ -11,7 +12,7 @@ use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
-use codex_windows_sandbox::add_deny_write_ace;
+
 use codex_windows_sandbox::convert_string_sid_to_sid;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
@@ -585,7 +586,7 @@ fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<(
         SetupMode::Full => run_setup_full(payload, &identity, log, sbx_dir),
         SetupMode::Uninstall => run_uninstall_only(payload, &identity, log),
     }?;
-    if writes_setup_marker {
+    if writes_setup_marker && !matches!(payload.mode, SetupMode::ProvisionOnly) {
         commit_setup_marker(
             &payload.codex_home,
             &identity,
@@ -722,11 +723,14 @@ fn configure_offline_sandbox_network(
         &payload.codex_home,
         identity,
         &identity.offline_username(),
+        &payload.real_user,
         payload.otel.as_ref(),
         |message| {
             let _ = log_line(log, message);
         },
     );
+    // Telemetry remains best effort; the containment boundary does not.
+    codex_windows_sandbox::read_live_filter_facts(&payload.codex_home, identity, offline_sid_str)?;
     Ok(())
 }
 
@@ -754,11 +758,12 @@ fn recorded_setup_roots(codex_home: &Path) -> Vec<PathBuf> {
 }
 
 /// Removes exactly the resources owned by `identity`. Every step is
-/// best-effort-logged; a failure in one resource family does not stop the
-/// removal of the others, and no resource owned by a different installation
+/// logged; ACL failure stops before destroying the group needed for retry,
+/// and no resource owned by a different installation
 /// (Codex-global or otherwise) is ever touched.
 /// Production wiring of the uninstall state machine: real Win32/COM/WFP
 /// effects over the payload's codex home, with a file-backed atomic journal.
+/// ACL failures preserve the group and stop before later phases so retry can resolve its SID.
 fn run_uninstall_only(
     payload: &Payload,
     identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
@@ -961,7 +966,10 @@ impl uninstall_state_machine::UninstallJournalIo for FileCleanupJournalIo {
             journal,
             move |temp_name| {
                 let temp_path = sandbox_dir.join(temp_name);
-                let file = std::fs::File::create(&temp_path)?;
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)?;
                 Ok((temp_path, file))
             },
             move |temp_path, final_name| std::fs::rename(temp_path, rename_root.join(final_name)),
@@ -1106,18 +1114,62 @@ fn run_provision_only(
 
     // R2B: mint the nonce-bound machine-effect receipt. Main never writes
     // this file; it only verifies it against the request and the marker.
-    write_provisioning_receipt(
-        payload,
-        identity,
-        &request,
-        &offline_sid_str,
-        &online_sid_str,
-        &sandbox_group_sid_str,
-        log,
-    )?;
+    finalize_provisioned_setup(payload, identity, || {
+        write_provisioning_receipt(
+            payload,
+            identity,
+            &request,
+            &offline_sid_str,
+            &online_sid_str,
+            &sandbox_group_sid_str,
+            log,
+        )
+    })?;
 
     log_note("setup provisioning binary completed", Some(sbx_dir));
     Ok(())
+}
+
+// The receipt must bind final marker bytes, never the empty protected
+// placeholder created before provisioning. The outer setup path does not
+// rewrite this marker after the nonce-bound receipt has been minted.
+fn finalize_provisioned_setup(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    write_receipt: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    commit_setup_marker(
+        &payload.codex_home,
+        identity,
+        &payload.proxy_ports,
+        payload.allow_local_binding,
+        &payload.read_roots,
+        &payload.write_roots,
+    )?;
+    write_receipt()
+}
+
+// The frozen offline backend installs three BLOCK rules. The old proxy
+// ALLOW rule is deliberately removed by ensure_offline_proxy_allowlist.
+fn verified_provisioning_firewall_rules(
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    present: &[String],
+) -> Result<Vec<String>> {
+    let mut expected = vec![
+        identity.offline_block_rule_name(),
+        identity.offline_block_loopback_tcp_rule_name(),
+        identity.offline_block_loopback_udp_rule_name(),
+    ];
+    expected.sort();
+    let mut actual = present.to_vec();
+    actual.sort();
+    if actual != expected {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUnknownError,
+            "offline firewall closure must contain exactly three BLOCK rules and no legacy ALLOW rule",
+        )));
+    }
+    Ok(expected)
 }
 
 /// Collects the exact provisioned facts and writes the nonce-bound receipt
@@ -1167,23 +1219,10 @@ fn write_provisioning_receipt(
         }
     };
 
-    // Exact firewall identities derived from the installation, verified
-    // live: every derived rule must still exist right now.
-    let firewall_rule_names = vec![
-        identity.offline_block_rule_name(),
-        identity.offline_block_loopback_tcp_rule_name(),
-        identity.offline_block_loopback_udp_rule_name(),
-        identity.offline_allow_loopback_proxy_rule_name(),
-    ];
-    let firewall_present = firewall::firewall_rules_present(identity);
-    for name in &firewall_rule_names {
-        if !firewall_present.contains(name) {
-            return Err(anyhow::Error::new(SetupFailure::new(
-                SetupErrorCode::HelperUnknownError,
-                format!("firewall rule {name} is absent at receipt time"),
-            )));
-        }
-    }
+    let firewall_rule_names = verified_provisioning_firewall_rules(
+        identity,
+        &firewall::firewall_rules_present(identity),
+    )?;
 
     // WFP keys come from the REQUIRED ownership record; the filter-key map
     // must cover exactly the static spec set - no missing or extra names.
@@ -1554,7 +1593,7 @@ fn run_setup_full(
                     .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
             };
 
-            match unsafe { add_deny_write_ace(path, deny_psid) } {
+            match unsafe { ls_owned_acl::protect(path, deny_psid, payload, identity) } {
                 Ok(true) => {
                     log_line(
                         log,
@@ -1652,6 +1691,56 @@ mod tests {
         let payload: Payload = serde_json::from_value(payload_json()).expect("payload");
 
         assert_eq!(payload.otel, None);
+    }
+
+    #[test]
+    fn provisioning_receipt_rejects_missing_duplicate_and_legacy_allow_rules() {
+        let identity = codex_windows_sandbox::installation::SandboxInstallationIdentity::generate();
+        let blocks = vec![
+            identity.offline_block_rule_name(),
+            identity.offline_block_loopback_tcp_rule_name(),
+            identity.offline_block_loopback_udp_rule_name(),
+        ];
+        assert!(super::verified_provisioning_firewall_rules(&identity, &blocks).is_ok());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &blocks[..2]).is_err());
+        let mut legacy = blocks.clone();
+        legacy.push(identity.offline_allow_loopback_proxy_rule_name());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &legacy).is_err());
+        let mut duplicate = blocks.clone();
+        duplicate.push(blocks[0].clone());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &duplicate).is_err());
+    }
+
+    #[test]
+    fn provisioning_receipt_binds_final_marker_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let codex_home = temporary.path();
+        std::fs::create_dir(codex_home.join(".sandbox")).expect("sandbox");
+        let marker = codex_home.join(".sandbox/setup_marker.json");
+        std::fs::write(&marker, b"").expect("placeholder");
+        let mut value = payload_json();
+        value["codex_home"] = serde_json::json!(codex_home);
+        value["mode"] = serde_json::json!("provision-only");
+        let payload: Payload = serde_json::from_value(value).expect("payload");
+        let identity = codex_windows_sandbox::installation::SandboxInstallationIdentity::generate();
+        let mut recorded = None;
+        super::finalize_provisioned_setup(&payload, &identity, || {
+            let contents = std::fs::read(&marker)?;
+            let value: serde_json::Value = serde_json::from_slice(&contents)?;
+            assert_eq!(
+                value["install_id"],
+                serde_json::json!(identity.install_id_hex())
+            );
+            recorded = Some(codex_windows_sandbox::setup_receipt::sha256_hex(&contents));
+            Ok(())
+        })
+        .expect("finalized");
+        assert_eq!(
+            recorded,
+            Some(
+                codex_windows_sandbox::setup_receipt::sha256_file_hex(&marker).expect("final hash")
+            )
+        );
     }
 
     #[test]

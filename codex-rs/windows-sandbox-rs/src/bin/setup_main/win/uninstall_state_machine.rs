@@ -13,6 +13,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -98,7 +99,12 @@ pub fn write_journal_atomic(
 ) -> std::io::Result<()> {
     let payload = serde_json::to_vec_pretty(journal)
         .map_err(|err| std::io::Error::other(format!("serialize cleanup journal: {err}")))?;
-    let nonce = format!("{}.tmp-{}", CLEANUP_JOURNAL_FILE_NAME, journal.updated_at);
+    // Timestamps contain colons on every ordinary RFC3339 value and must
+    // never be used as Windows filenames. Keep them only in the payload.
+    let nonce = format!(
+        "{CLEANUP_JOURNAL_FILE_NAME}.tmp-{:016x}",
+        rand::rngs::OsRng.next_u64()
+    );
     let (temp_path, mut file) = open_temp(&nonce)?;
     let result = (|| -> std::io::Result<()> {
         file.write_all(&payload)?;
@@ -162,7 +168,7 @@ pub fn run_uninstall(
         }
     }
 
-    let completed = journal.as_ref().map(|entry| entry.completed_phase);
+    let mut completed = journal.as_ref().map(|entry| entry.completed_phase);
     // The journal binds the ownership-record digest from its first write (or
     // the resumed journal keeps its original binding); a later mismatch with
     // the persisted record fails closed before any phase runs.
@@ -199,6 +205,34 @@ pub fn run_uninstall(
         }]);
     }
 
+    // Older journals marked attempted deletions as completed. Reconcile
+    // those checkpoints against live presence so a retry actually removes
+    // a surviving resource rather than checking the same failure forever.
+    if completed.is_some_and(|phase| phase >= UninstallPhase::FirewallRemoved)
+        && !effects.firewall_rules_present(identity).is_empty()
+    {
+        completed = Some(UninstallPhase::AclRemoved);
+    } else if completed.is_some_and(|phase| phase >= UninstallPhase::WfpRemoved)
+        && !effects.wfp_objects_present(identity).is_empty()
+    {
+        completed = Some(UninstallPhase::FirewallRemoved);
+    } else if completed.is_some_and(|phase| phase >= UninstallPhase::AccountsRemoved)
+        && !effects.accounts_present(identity).is_empty()
+    {
+        completed = Some(UninstallPhase::WfpRemoved);
+    }
+
+    // Persist the exact ownership before changing ACLs. If that stage
+    // fails, Pending preserves the group identity and makes retry repeat it.
+    if completed.is_none()
+        && let Err(err) = advance(UninstallPhase::Pending)
+    {
+        return Err(vec![UninstallFailure {
+            phase: "journal",
+            detail: format!("journal write failed: {err}"),
+        }]);
+    }
+
     // ---- Phase 1: ACL removal ------------------------------------------
     if completed
         .map(|done| done < UninstallPhase::AclRemoved)
@@ -220,6 +254,11 @@ pub fn run_uninstall(
         } else {
             log("acl phase: sandbox group no longer resolvable; skipping ACE sweep");
         }
+        if !failures.is_empty() {
+            // Deleting the group now would destroy the SID lookup needed to
+            // remove the remaining ACEs. Do not journal this phase as done.
+            return Err(failures);
+        }
         if let Err(err) = advance(UninstallPhase::AclRemoved) {
             failures.push(UninstallFailure {
                 phase: "acl-removed",
@@ -236,6 +275,13 @@ pub fn run_uninstall(
         .unwrap_or(true)
     {
         effects.remove_firewall_rules(identity);
+        let remaining = effects.firewall_rules_present(identity);
+        if !remaining.is_empty() {
+            return Err(vec![UninstallFailure {
+                phase: "firewall-removed",
+                detail: format!("firewall rules still present: {}", remaining.join(", ")),
+            }]);
+        }
         if let Err(err) = advance(UninstallPhase::FirewallRemoved) {
             failures.push(UninstallFailure {
                 phase: "firewall-removed",
@@ -252,6 +298,13 @@ pub fn run_uninstall(
         .unwrap_or(true)
     {
         effects.remove_wfp_objects(identity);
+        let remaining = effects.wfp_objects_present(identity);
+        if !remaining.is_empty() {
+            return Err(vec![UninstallFailure {
+                phase: "wfp-removed",
+                detail: format!("WFP objects still present: {}", remaining.join(", ")),
+            }]);
+        }
         if let Err(err) = advance(UninstallPhase::WfpRemoved) {
             failures.push(UninstallFailure {
                 phase: "wfp-removed",
@@ -268,6 +321,13 @@ pub fn run_uninstall(
         .unwrap_or(true)
     {
         effects.remove_accounts(identity);
+        let remaining = effects.accounts_present(identity);
+        if !remaining.is_empty() {
+            return Err(vec![UninstallFailure {
+                phase: "accounts-removed",
+                detail: format!("accounts still present: {}", remaining.join(", ")),
+            }]);
+        }
         if let Err(err) = advance(UninstallPhase::AccountsRemoved) {
             failures.push(UninstallFailure {
                 phase: "accounts-removed",
@@ -279,9 +339,8 @@ pub fn run_uninstall(
     }
 
     // ---- Phase 5: verified absence -------------------------------------
-    if completed
-        .map(|done| done < UninstallPhase::VerifiedAbsent)
-        .unwrap_or(true)
+    // Even a resumed verified checkpoint must be re-read before deleting
+    // its last ownership records.
     {
         let firewall = effects.firewall_rules_present(identity);
         let wfp = effects.wfp_objects_present(identity);

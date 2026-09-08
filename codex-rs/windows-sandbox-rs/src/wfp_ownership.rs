@@ -154,18 +154,6 @@ pub fn write_wfp_ownership(codex_home: &Path, record: &WfpOwnershipRecord) -> Re
     fs::write(&path, json).with_context(|| format!("write {}", path.display()))
 }
 
-pub fn delete_wfp_ownership(codex_home: &Path) -> Result<()> {
-    let path = wfp_ownership_path(codex_home);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(anyhow::Error::msg(format!(
-            "remove {}: {err}",
-            path.display()
-        ))),
-    }
-}
-
 impl WfpOwnershipRecord {
     pub fn provider_key_u128(&self) -> Result<u128> {
         key_from_hex(&self.provider_key)

@@ -67,6 +67,31 @@ pub fn quote_windows_arg(arg: &str) -> String {
 /// Build a Windows command line for CreateProcess-style APIs.
 #[cfg(target_os = "windows")]
 pub fn argv_to_command_line(argv: &[String]) -> String {
+    // cmd consumes the argument after /c or /k as shell source, not a CRT
+    // argument. Escaping its inner quotes with backslashes corrupts paths
+    // and nested commands. /s strips only the enclosing pair we add here.
+    let is_cmd = argv
+        .first()
+        .and_then(|exe| std::path::Path::new(exe).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        });
+    if is_cmd
+        && let Some(script_flag) = argv
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+        && argv.len() == script_flag + 2
+    {
+        let prefix = argv[..script_flag]
+            .iter()
+            .map(|arg| quote_windows_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let flag = &argv[script_flag];
+        let script = &argv[script_flag + 1];
+        return format!("{prefix} /s {flag} \"{script}\"");
+    }
     argv.iter()
         .map(|arg| quote_windows_arg(arg))
         .collect::<Vec<_>>()
@@ -206,14 +231,18 @@ pub(crate) fn sid_bytes_from_string(sid_str: &str) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[path = "ls_command_line_tests.rs"]
+mod ls_command_line_tests;
+
+#[cfg(test)]
 mod tests {
     use super::argv_to_command_line;
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn argv_to_command_line_quotes_each_argument_independently() {
+    fn argv_to_command_line_quotes_nested_regular_program_args() {
         let argv = vec![
-            "cmd.exe".to_string(),
+            "tool.exe".to_string(),
             "/c".to_string(),
             "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -EncodedCommand abc=="
                 .to_string(),
@@ -221,7 +250,7 @@ mod tests {
 
         assert_eq!(
             argv_to_command_line(&argv),
-            "cmd.exe /c \"\\\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\\\" -NoProfile -EncodedCommand abc==\""
+            "tool.exe /c \"\\\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\\\" -NoProfile -EncodedCommand abc==\""
         );
     }
 

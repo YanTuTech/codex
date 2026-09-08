@@ -128,13 +128,14 @@ pub fn install_wfp_filters<F>(
     codex_home: &Path,
     identity: &SandboxInstallationIdentity,
     offline_username: &str,
+    readback_user: &str,
     otel: Option<&StatsigMetricsSettings>,
     mut log: F,
 ) where
     F: FnMut(&str),
 {
     let metric = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        install_wfp_filters_for_installation(codex_home, identity, offline_username)
+        install_wfp_filters_for_installation(codex_home, identity, offline_username, readback_user)
     })) {
         Ok(Ok(installed_filter_count)) => {
             log(&format!(

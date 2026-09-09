@@ -1216,10 +1216,18 @@ mod containment_matrix {
     }
 
     #[test]
-    fn external_public_read_matches_workspace_write_policy() {
+    fn external_user_profile_read_is_denied() {
         let fixture = Fixture::new();
-        assert_eq!(std::fs::read(&fixture.external_file).unwrap(), b"original");
-        let victim = fixture.external_file.to_string_lossy().to_string();
+        let profile = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+        let private = tempfile::Builder::new()
+            .prefix("ls-d8-read-canary-")
+            .tempfile_in(profile.join("AppData").join("Local"))
+            .unwrap();
+        std::fs::write(private.path(), b"synthetic-d8-canary").unwrap();
+        let victim = dunce::canonicalize(private.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let nonce = fixture
             .workspace
             .parent()
@@ -1228,9 +1236,9 @@ mod containment_matrix {
             .unwrap()
             .to_string_lossy();
         let code = format!(
-            "import sys; print('START-{nonce}', flush=True); data = open(r'{victim}', 'rb').read(); print('READ-{nonce}' if data == b'original' else 'WRONG'); sys.exit(0 if data == b'original' else 3)"
+            "import sys\nprint('START-{nonce}', flush=True)\ntry:\n data = open(r'{victim}', 'rb').read()\nexcept PermissionError:\n print('DENIED-{nonce}', flush=True)\n sys.exit(23)\nprint('READ-{nonce}' if data == b'synthetic-d8-canary' else 'WRONG', flush=True)\nsys.exit(0 if data == b'synthetic-d8-canary' else 3)"
         );
-        let expected = format!("START-{nonce}\nREAD-{nonce}\n");
+        let host_expected = format!("START-{nonce}\nREAD-{nonce}\n");
         let host = Command::new("python").args(["-c", &code]).output().unwrap();
         assert_eq!(
             host.status.code(),
@@ -1239,17 +1247,21 @@ mod containment_matrix {
         );
         assert_eq!(
             String::from_utf8_lossy(&host.stdout).replace("\r\n", "\n"),
-            expected
+            host_expected
         );
         let read = run_tool(&fixture, "python", &["-c", &code]);
         assert_eq!(
             read.status.code(),
-            Some(0),
-            "ordinary external read: {read:?}"
+            Some(23),
+            "AppData read must be denied by the sandbox identity: {read:?}"
         );
         assert_eq!(
             String::from_utf8_lossy(&read.stdout).replace("\r\n", "\n"),
-            expected
+            format!("START-{nonce}\nDENIED-{nonce}\n")
+        );
+        assert_eq!(
+            std::fs::read(private.path()).unwrap(),
+            b"synthetic-d8-canary"
         );
     }
 

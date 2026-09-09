@@ -370,9 +370,11 @@ mod windows_backend {
     use codex_windows_sandbox::WindowsSandboxSessionRequest;
 
     /// Builds the Codex session request from the launch plan with every
-    /// widening knob pinned shut: no read/write root overrides, no deny-list
-    /// overrides, no proxy or network elevation, no private desktop, and no
-    /// backend-enforced timeout (the runner enforces its own 124 semantics).
+    /// widening knob pinned shut. The explicit empty read-root override is
+    /// security-significant: `None` asks Codex workspace-write to grant the
+    /// sandbox account read access across the real user's profile, while V1
+    /// permits only the workspace, sandbox-owned roots, and the OS/toolchain
+    /// closure already readable by the low-privilege Windows identity.
     ///
     /// Descendants are preserved at the backend level because the elevated
     /// backend does not support terminating them on root exit; the runner's
@@ -382,6 +384,7 @@ mod windows_backend {
     pub fn build_session_request(
         plan: &WindowsSandboxLaunchPlan,
     ) -> WindowsSandboxSessionRequest<'_> {
+        const NO_EXTRA_READ_ROOTS: &[PathBuf] = &[];
         const NO_DENY_PATHS: &[AbsolutePathBuf] = &[];
         WindowsSandboxSessionRequest {
             permission_profile: &plan.permission_profile,
@@ -399,7 +402,7 @@ mod windows_backend {
             network_proxy_restricting_sid: None,
             proxy_settings_mode: WindowsSandboxProxySettingsMode::default(),
             timeout_ms: None,
-            read_roots_override: None,
+            read_roots_override: Some(NO_EXTRA_READ_ROOTS),
             read_roots_include_platform_defaults: false,
             write_roots_override: None,
             deny_read_paths_override: NO_DENY_PATHS,
@@ -704,7 +707,7 @@ mod tests {
             let request = build_session_request(&plan);
             assert_eq!(request.workspace_roots.len(), 1);
             assert_eq!(request.workspace_roots[0].as_path(), root);
-            assert!(request.read_roots_override.is_none());
+            assert_eq!(request.read_roots_override, Some([].as_slice()));
             assert!(request.write_roots_override.is_none());
             assert!(request.deny_read_paths_override.is_empty());
             assert_eq!(request.deny_write_paths_override, plan.deny_write_paths);

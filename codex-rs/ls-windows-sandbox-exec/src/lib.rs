@@ -5,12 +5,11 @@
 //! The runner delegates filesystem, token, process-tree, and network-policy
 //! projection to the shared `codex-windows-sandbox` implementation; this crate
 //! never hand-writes token, ACL, Job Object, or WFP policy. It accepts exactly
-//! one canonical workspace root and a fixed `workspace-write` profile. The
-//! live path selects only the product-scoped `Elevated` backend: kernel WFP
-//! network denial, restricted reads, and a dedicated low-privilege identity
-//! come from the administrator-approved installation setup. The
-//! RestrictedToken backend is reachable only by native qualification tests,
-//! never by a runtime flag or automatic fallback.
+//! one canonical workspace root and a fixed `workspace-write` profile. Host
+//! authority selects either the product-scoped `Elevated` backend (dedicated
+//! low-privilege identity + kernel WFP denial) or the explicitly weaker
+//! `RestrictedToken` backend (current-user restricted token + environment
+//! offline controls). No selection falls back to unsandboxed execution.
 //!
 //! Runner-own failures (argument errors, unusable roots, spawn errors, or a
 //! missing sandbox prerequisite) print a single
@@ -63,20 +62,29 @@ const PRESERVED_ENV_KEYS: &[(&str, &str)] = &[
     ("WINDIR", "WINDIR"),
 ];
 
-/// The internally selected Windows sandbox level for the frozen filesystem
-/// write/process contract. The live path selects only the Codex `Elevated`
-/// backend: kernel-enforced network denial and restricted reads require the
-/// product-scoped elevated installation (accounts, ACLs, WFP). The
-/// Restricted Token backend remains reachable only by native qualification
-/// tests, never by a runtime flag or fallback.
+/// Host-selected backend. The runner accepts only these two closed values;
+/// roots, policy JSON, network allowlists, and arbitrary sandbox flags remain
+/// unavailable to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsSandboxBackend {
+    Elevated,
+    RestrictedToken,
+}
+
 #[cfg(target_os = "windows")]
-pub fn selected_windows_sandbox_level() -> WindowsSandboxLevel {
-    WindowsSandboxLevel::Elevated
+pub fn selected_windows_sandbox_level(backend: WindowsSandboxBackend) -> WindowsSandboxLevel {
+    match backend {
+        WindowsSandboxBackend::Elevated => WindowsSandboxLevel::Elevated,
+        WindowsSandboxBackend::RestrictedToken => WindowsSandboxLevel::RestrictedToken,
+    }
 }
 
 /// Parsed runner inputs that do not depend on the command being executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSandboxExecOptions {
+    /// Host-selected strong or weaker sandbox backend. Defaults to Elevated
+    /// when omitted for backwards compatibility with already pinned callers.
+    pub backend: WindowsSandboxBackend,
     /// The one writable workspace root. It must already be canonical
     /// (absolute, existing, a directory, and free of symlink/junction or
     /// `..` components) so the sandbox policy never contains aliased path
@@ -95,6 +103,8 @@ pub struct WindowsSandboxExecOptions {
 /// cannot be widened afterwards.
 #[derive(Debug)]
 pub struct WindowsSandboxLaunchPlan {
+    /// Backend chosen by the Host before the plan is built.
+    pub backend: WindowsSandboxBackend,
     /// Exactly one materialized writable workspace root.
     pub workspace_roots: Vec<AbsolutePathBuf>,
     /// Fixed Codex managed `workspace-write` profile with restricted
@@ -120,7 +130,7 @@ pub struct WindowsSandboxLaunchPlan {
 }
 
 /// Parses the frozen CLI grammar:
-/// `--workspace-root <dir> --codex-home <dir> [--timeout-ms <n>] -- <command>...`
+/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--timeout-ms <n>] -- <command>...`
 ///
 /// Syntax only; filesystem validation happens in
 /// [`build_launch_plan`]. No other flag exists on purpose:
@@ -140,6 +150,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
     let mut workspace_root: Option<String> = None;
     let mut codex_home: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
+    let mut backend: Option<WindowsSandboxBackend> = None;
 
     let mut index = 0;
     while index < flags.len() {
@@ -168,6 +179,17 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
                 }
                 timeout_ms = Some(parsed);
             }
+            "--backend" => {
+                let value = next_flag_value(flags, &mut index, flag)?;
+                if backend.is_some() {
+                    return Err(format!("duplicate flag {flag}"));
+                }
+                backend = Some(match value.as_str() {
+                    "elevated" => WindowsSandboxBackend::Elevated,
+                    "restricted-token" => WindowsSandboxBackend::RestrictedToken,
+                    _ => return Err(format!("invalid value for {flag}: `{value}`")),
+                });
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -177,6 +199,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
     let codex_home =
         codex_home.ok_or_else(|| "missing required flag --codex-home <dir>".to_string())?;
     Ok(WindowsSandboxExecOptions {
+        backend: backend.unwrap_or(WindowsSandboxBackend::Elevated),
         workspace_root: PathBuf::from(workspace_root),
         codex_home: PathBuf::from(codex_home),
         timeout_ms,
@@ -292,6 +315,7 @@ where
     env.push(("TEMP".to_string(), managed_temp.clone()));
     env.push(("TMP".to_string(), managed_temp));
     Ok(WindowsSandboxLaunchPlan {
+        backend: options.backend,
         workspace_roots: vec![absolute_root],
         permission_profile: PermissionProfile::workspace_write(),
         codex_home,
@@ -397,7 +421,7 @@ mod windows_backend {
                 .iter()
                 .cloned()
                 .collect::<HashMap<String, String>>(),
-            windows_sandbox_level: super::selected_windows_sandbox_level(),
+            windows_sandbox_level: super::selected_windows_sandbox_level(plan.backend),
             proxy_enforced: false,
             network_proxy_restricting_sid: None,
             proxy_settings_mode: WindowsSandboxProxySettingsMode::default(),
@@ -618,6 +642,27 @@ mod tests {
     fn parse_cli_reports_syntax_errors_without_touching_the_filesystem() {
         assert!(parse_cli(&[]).is_err());
         assert!(parse_cli(&["--".to_string()]).is_err());
+        let base = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+        ];
+        let args = base
+            .into_iter()
+            .chain(["--backend", "restricted-token", "--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&args).unwrap().backend,
+            WindowsSandboxBackend::RestrictedToken
+        );
+        let invalid = base
+            .into_iter()
+            .chain(["--backend", "unknown", "--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(parse_cli(&invalid).is_err());
     }
 
     /// Task 2 adapter tests: the launch plan and session request pin every
@@ -635,6 +680,7 @@ mod tests {
 
         fn options_for(root: &Path, home: &Path) -> WindowsSandboxExecOptions {
             WindowsSandboxExecOptions {
+                backend: WindowsSandboxBackend::Elevated,
                 workspace_root: root.to_path_buf(),
                 codex_home: home.to_path_buf(),
                 timeout_ms: None,
@@ -736,6 +782,16 @@ mod tests {
             assert!(!request.env_map.contains_key("LS_RUNTIME_UPSTREAM_API_KEY"));
             assert!(!request.env_map.contains_key("RB_RUNTIME_UPSTREAM_API_KEY"));
             assert!(request.env_map.contains_key("PATH"));
+
+            let mut restricted_options = options_for(&root, &codex_home);
+            restricted_options.backend = WindowsSandboxBackend::RestrictedToken;
+            let restricted_plan =
+                build_launch_plan(&restricted_options, &sample_command(), parent_env()).unwrap();
+            let restricted_request = build_session_request(&restricted_plan);
+            assert_eq!(
+                restricted_request.windows_sandbox_level,
+                WindowsSandboxLevel::RestrictedToken
+            );
         }
 
         #[test]
@@ -752,6 +808,7 @@ mod tests {
             let (_workspace, root) = canonical_temp_dir();
             let (_home, codex_home) = canonical_temp_dir();
             let options = WindowsSandboxExecOptions {
+                backend: WindowsSandboxBackend::Elevated,
                 workspace_root: root.join("sub").join(".."),
                 codex_home,
                 timeout_ms: None,

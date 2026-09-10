@@ -405,6 +405,48 @@ fn non_windows_host_fails_closed_even_with_valid_arguments() {
     assert_runner_failure(&output, "Windows");
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+#[allow(clippy::unwrap_used)] // native qualification: every failed observation is the assertion
+fn restricted_token_backend_writes_only_the_workspace_and_marks_environment_offline() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    let (external, external_root) = canonical_temp_dir();
+    let workspace_file = workspace_root.join("inside.txt");
+    let external_file = external_root.join("outside.txt");
+    let script = format!(
+        "echo INSIDE>\"{}\" & echo OUTSIDE>\"{}\" & echo NONET=%SBX_NONET_ACTIVE%",
+        workspace_file.display(),
+        external_file.display()
+    );
+    let mut args = valid_prefix(&workspace_root, &codex_home);
+    args.extend([
+        "--backend".to_string(),
+        "restricted-token".to_string(),
+        "--".to_string(),
+        "cmd".to_string(),
+        "/d".to_string(),
+        "/s".to_string(),
+        "/c".to_string(),
+        script,
+    ]);
+    let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(
+        output.status.success(),
+        "restricted-token runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workspace_file.exists(), "workspace write was not admitted");
+    assert!(
+        !external_file.exists(),
+        "restricted-token backend wrote outside the workspace"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("NONET=1"),
+        "restricted-token backend did not expose its environment-offline marker"
+    );
+    drop(external);
+}
+
 /// Native Windows containment matrix (Task 4).
 ///
 /// Every case uses a fresh temporary workspace plus a separate external

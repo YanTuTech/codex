@@ -5,8 +5,11 @@
 //! The runner delegates filesystem, token, process-tree, and network-policy
 //! projection to the shared `codex-windows-sandbox` implementation; this crate
 //! never hand-writes token, ACL, Job Object, or WFP policy. It accepts exactly
-//! one canonical workspace root and a fixed `workspace-write` profile. Host
-//! authority selects either the product-scoped `Elevated` backend (dedicated
+//! one canonical workspace root and a Host-selected closed sandbox mode: the
+//! default `workspace-write` profile or the strictly narrower `read-only`
+//! profile (commands execute inside the sandbox with every write denied,
+//! including the runner-managed TEMP/TMP root). Host authority additionally
+//! selects either the product-scoped `Elevated` backend (dedicated
 //! low-privilege identity + kernel WFP denial) or the explicitly weaker
 //! `RestrictedToken` backend (current-user restricted token + environment
 //! offline controls). No selection falls back to unsandboxed execution.
@@ -79,16 +82,34 @@ pub fn selected_windows_sandbox_level(backend: WindowsSandboxBackend) -> Windows
     }
 }
 
+/// Host-selected sandbox mode. The runner accepts only these two closed
+/// values: the default `workspace-write` profile (the one materialized
+/// workspace root plus the runner-managed TEMP/TMP root stay writable) and the
+/// strictly narrower `read-only` profile (the sandboxed command may read the
+/// workspace but every write is denied, including TEMP/TMP; there is no
+/// writable root at all). Arbitrary per-root policy, network, and environment
+/// knobs remain unavailable to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WindowsSandboxMode {
+    #[default]
+    WorkspaceWrite,
+    ReadOnly,
+}
+
 /// Parsed runner inputs that do not depend on the command being executed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowsSandboxExecOptions {
     /// Host-selected strong or weaker sandbox backend. Defaults to Elevated
     /// when omitted for backwards compatibility with already pinned callers.
     pub backend: WindowsSandboxBackend,
+    /// Host-selected closed sandbox mode. Defaults to `workspace-write` for
+    /// backwards compatibility with already pinned callers.
+    pub mode: WindowsSandboxMode,
     /// The one writable workspace root. It must already be canonical
     /// (absolute, existing, a directory, and free of symlink/junction or
     /// `..` components) so the sandbox policy never contains aliased path
     /// components. It is also the working directory of the sandboxed command.
+    /// Under `read-only` it stays readable but never becomes writable.
     pub workspace_root: PathBuf,
     /// Sandbox state directory (Codex-qualified). Same canonical-directory
     /// contract as [`Self::workspace_root`].
@@ -105,10 +126,13 @@ pub struct WindowsSandboxExecOptions {
 pub struct WindowsSandboxLaunchPlan {
     /// Backend chosen by the Host before the plan is built.
     pub backend: WindowsSandboxBackend,
-    /// Exactly one materialized writable workspace root.
+    /// Sandbox mode chosen by the Host before the plan is built.
+    pub sandbox_mode: WindowsSandboxMode,
+    /// Exactly one materialized workspace root.
     pub workspace_roots: Vec<AbsolutePathBuf>,
-    /// Fixed Codex managed `workspace-write` profile with restricted
-    /// network; enforcement comes from the selected backend.
+    /// The closed Codex managed permission profile selected by
+    /// [`WindowsSandboxMode`]: `workspace-write` or `read-only`, both with
+    /// restricted network; enforcement comes from the selected backend.
     pub permission_profile: PermissionProfile,
     /// Validated sandbox state directory.
     pub codex_home: PathBuf,
@@ -130,7 +154,7 @@ pub struct WindowsSandboxLaunchPlan {
 }
 
 /// Parses the frozen CLI grammar:
-/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--timeout-ms <n>] -- <command>...`
+/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--sandbox-mode <workspace-write|read-only>] [--timeout-ms <n>] -- <command>...`
 ///
 /// Syntax only; filesystem validation happens in
 /// [`build_launch_plan`]. No other flag exists on purpose:
@@ -151,6 +175,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
     let mut codex_home: Option<String> = None;
     let mut timeout_ms: Option<u64> = None;
     let mut backend: Option<WindowsSandboxBackend> = None;
+    let mut mode: Option<WindowsSandboxMode> = None;
 
     let mut index = 0;
     while index < flags.len() {
@@ -190,6 +215,17 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
                     _ => return Err(format!("invalid value for {flag}: `{value}`")),
                 });
             }
+            "--sandbox-mode" => {
+                let value = next_flag_value(flags, &mut index, flag)?;
+                if mode.is_some() {
+                    return Err(format!("duplicate flag {flag}"));
+                }
+                mode = Some(match value.as_str() {
+                    "workspace-write" => WindowsSandboxMode::WorkspaceWrite,
+                    "read-only" => WindowsSandboxMode::ReadOnly,
+                    _ => return Err(format!("invalid value for {flag}: `{value}`")),
+                });
+            }
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -200,6 +236,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
         codex_home.ok_or_else(|| "missing required flag --codex-home <dir>".to_string())?;
     Ok(WindowsSandboxExecOptions {
         backend: backend.unwrap_or(WindowsSandboxBackend::Elevated),
+        mode: mode.unwrap_or_default(),
         workspace_root: PathBuf::from(workspace_root),
         codex_home: PathBuf::from(codex_home),
         timeout_ms,
@@ -268,9 +305,13 @@ pub fn validate_canonical_directory(value: &Path, flag: &str) -> Result<PathBuf,
 }
 
 /// Builds the runner-internal launch plan from validated options. This is
-/// the only place the fixed profile is chosen: one canonical workspace root,
-/// Codex managed `workspace-write`, a runner-owned TEMP/TMP root, the fixed
-/// environment allowlist, and no override knobs at all.
+/// the only place the closed profile is chosen: one canonical workspace root,
+/// the Host-selected Codex managed profile (`workspace-write` or
+/// `read-only`), a runner-owned TEMP/TMP root, the fixed environment
+/// allowlist, and no override knobs at all. Under `read-only` the managed
+/// TEMP/TMP root still exists and is exported through the environment, but it
+/// is never granted to the sandbox identity: every write, including scratch
+/// writes, fails closed.
 pub fn build_launch_plan<I, K, V>(
     options: &WindowsSandboxExecOptions,
     command: &[String],
@@ -310,14 +351,19 @@ where
         .map_err(|err| format!("--workspace-root is not absolute: {err}"))?;
     let denied_codex_home = AbsolutePathBuf::from_absolute_path(&codex_home)
         .map_err(|err| format!("--codex-home is not absolute: {err}"))?;
+    let permission_profile = match options.mode {
+        WindowsSandboxMode::WorkspaceWrite => PermissionProfile::workspace_write(),
+        WindowsSandboxMode::ReadOnly => PermissionProfile::read_only(),
+    };
     let mut env = filtered_environment_from(parent_vars);
     let managed_temp = command_temp_root.to_string_lossy().into_owned();
     env.push(("TEMP".to_string(), managed_temp.clone()));
     env.push(("TMP".to_string(), managed_temp));
     Ok(WindowsSandboxLaunchPlan {
         backend: options.backend,
+        sandbox_mode: options.mode,
         workspace_roots: vec![absolute_root],
-        permission_profile: PermissionProfile::workspace_write(),
+        permission_profile,
         codex_home,
         command: command.to_vec(),
         cwd: workspace_root,
@@ -409,6 +455,7 @@ mod windows_backend {
         plan: &WindowsSandboxLaunchPlan,
     ) -> WindowsSandboxSessionRequest<'_> {
         const NO_EXTRA_READ_ROOTS: &[PathBuf] = &[];
+        const NO_WRITE_ROOTS: &[PathBuf] = &[];
         const NO_DENY_PATHS: &[AbsolutePathBuf] = &[];
         WindowsSandboxSessionRequest {
             permission_profile: &plan.permission_profile,
@@ -428,7 +475,14 @@ mod windows_backend {
             timeout_ms: None,
             read_roots_override: Some(NO_EXTRA_READ_ROOTS),
             read_roots_include_platform_defaults: false,
-            write_roots_override: None,
+            // `read-only` pins an explicit empty write-root override so the
+            // no-writable-root property does not depend on profile
+            // derivation; `workspace-write` keeps `None` and lets the
+            // profile materialize the workspace plus TEMP/TMP roots.
+            write_roots_override: match plan.sandbox_mode {
+                WindowsSandboxMode::ReadOnly => Some(NO_WRITE_ROOTS),
+                WindowsSandboxMode::WorkspaceWrite => None,
+            },
             deny_read_paths_override: NO_DENY_PATHS,
             deny_write_paths_override: &plan.deny_write_paths,
             tty: false,
@@ -665,6 +719,75 @@ mod tests {
         assert!(parse_cli(&invalid).is_err());
     }
 
+    #[test]
+    fn parse_cli_accepts_only_the_closed_sandbox_mode_values() {
+        let base = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+        ];
+        let readonly = base
+            .into_iter()
+            .chain(["--sandbox-mode", "read-only", "--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&readonly).unwrap().mode,
+            WindowsSandboxMode::ReadOnly
+        );
+        let workspace_write = base
+            .into_iter()
+            .chain(["--sandbox-mode", "workspace-write", "--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&workspace_write).unwrap().mode,
+            WindowsSandboxMode::WorkspaceWrite
+        );
+        // Omitted mode keeps the backwards-compatible default.
+        let default = base
+            .into_iter()
+            .chain(["--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&default).unwrap().mode,
+            WindowsSandboxMode::WorkspaceWrite
+        );
+        // Closed enum: every other value is rejected.
+        for hostile in ["readonly", "read_only", "danger-full-access", "full"] {
+            let invalid = base
+                .into_iter()
+                .chain(["--sandbox-mode", hostile, "--", "cmd"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let error = parse_cli(&invalid).unwrap_err();
+            assert!(
+                error.contains("invalid value for --sandbox-mode"),
+                "value {hostile:?} must be rejected; got: {error}"
+            );
+        }
+        // Duplicates are rejected like every other flag.
+        let duplicate = base
+            .into_iter()
+            .chain([
+                "--sandbox-mode",
+                "read-only",
+                "--sandbox-mode",
+                "workspace-write",
+                "--",
+                "cmd",
+            ])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            parse_cli(&duplicate)
+                .unwrap_err()
+                .contains("duplicate flag --sandbox-mode")
+        );
+    }
+
     /// Task 2 adapter tests: the launch plan and session request pin every
     /// knob shut.
     #[cfg(windows)]
@@ -681,6 +804,7 @@ mod tests {
         fn options_for(root: &Path, home: &Path) -> WindowsSandboxExecOptions {
             WindowsSandboxExecOptions {
                 backend: WindowsSandboxBackend::Elevated,
+                mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.to_path_buf(),
                 codex_home: home.to_path_buf(),
                 timeout_ms: None,
@@ -809,12 +933,66 @@ mod tests {
             let (_home, codex_home) = canonical_temp_dir();
             let options = WindowsSandboxExecOptions {
                 backend: WindowsSandboxBackend::Elevated,
+                mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.join("sub").join(".."),
                 codex_home,
                 timeout_ms: None,
             };
             let error = build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
             assert!(error.contains("canonical"), "got: {error}");
+        }
+
+        #[test]
+        fn read_only_launch_plan_pins_the_narrower_profile() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let mut options = options_for(&root, &codex_home);
+            options.mode = WindowsSandboxMode::ReadOnly;
+            let plan = build_launch_plan(&options, &sample_command(), parent_env()).unwrap();
+            // The read-only profile: no writable root exists at all.
+            assert_eq!(plan.permission_profile, PermissionProfile::read_only());
+            match &plan.permission_profile {
+                PermissionProfile::Managed { network, .. } => assert!(
+                    matches!(network, NetworkSandboxPolicy::Restricted),
+                    "read-only network policy must stay restricted"
+                ),
+                other => panic!("expected a managed permission profile, got {other:?}"),
+            }
+            // The permissions must still resolve for the Windows sandbox
+            // (the read-only capability path, not write capabilities).
+            let resolved =
+                codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                    &plan.permission_profile,
+                    &plan.workspace_roots,
+                );
+            assert!(resolved.is_ok(), "read-only profile must be enforceable");
+            // TEMP/TMP still point at the managed root, but the root is not
+            // exported as writable: the environment is unchanged and only the
+            // profile decides writability.
+            assert_eq!(
+                plan.env
+                    .iter()
+                    .find(|(key, _)| key == "TEMP")
+                    .map(|(_, value)| value.as_str()),
+                plan.command_temp_root.to_str()
+            );
+        }
+
+        #[test]
+        fn read_only_session_request_pins_an_empty_write_root_override() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let mut options = options_for(&root, &codex_home);
+            options.mode = WindowsSandboxMode::ReadOnly;
+            let plan = build_launch_plan(&options, &sample_command(), parent_env()).unwrap();
+            let request = build_session_request(&plan);
+            assert_eq!(
+                request.write_roots_override,
+                Some([].as_slice()),
+                "read-only must pin an explicit empty write-root override"
+            );
+            assert_eq!(request.read_roots_override, Some([].as_slice()));
+            assert_eq!(request.deny_write_paths_override, plan.deny_write_paths);
         }
     }
 }

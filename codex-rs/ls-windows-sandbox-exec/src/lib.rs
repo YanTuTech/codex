@@ -5,7 +5,8 @@
 //! The runner delegates filesystem, token, process-tree, and network-policy
 //! projection to the shared `codex-windows-sandbox` implementation; this crate
 //! never hand-writes token, ACL, Job Object, or WFP policy. It accepts exactly
-//! one canonical workspace root and a Host-selected closed sandbox mode: the
+//! one canonical workspace root plus optional Host-authorized extra write
+//! roots (never model input), and a Host-selected closed sandbox mode: the
 //! default `workspace-write` profile or the strictly narrower `read-only`
 //! profile (commands execute inside the sandbox with every write denied,
 //! including the runner-managed TEMP/TMP root). Host authority additionally
@@ -50,6 +51,10 @@ const MAX_FAILURE_REASON_CHARS: usize = 400;
 /// Long-running commands should use the product's durable async execution
 /// path. Bounding this value also prevents `Instant + Duration` overflow.
 const MAX_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Upper bound on Host-authorized extra write roots per command. The Host
+/// enforces the same cap; the runner re-checks so a runaway caller cannot
+/// project an unbounded ACL surface onto one sandboxed command.
+const MAX_EXTRA_WRITE_ROOTS: usize = 4;
 /// Grace period while reaping the sandbox process tree after a timeout kill
 /// before the runner gives up waiting on stragglers and exits 124 anyway.
 const TIMEOUT_REAP_GRACE: Duration = Duration::from_secs(5);
@@ -111,6 +116,12 @@ pub struct WindowsSandboxExecOptions {
     /// components. It is also the working directory of the sandboxed command.
     /// Under `read-only` it stays readable but never becomes writable.
     pub workspace_root: PathBuf,
+    /// Optional extra writable roots, each individually user-authorized by
+    /// the Host (never model input). Same canonical-directory contract as
+    /// [`Self::workspace_root`]; they must not overlap the workspace root,
+    /// the sandbox state root, or each other. Under `read-only` the grammar
+    /// rejects them outright: the no-writable-root property is never widened.
+    pub extra_write_roots: Vec<PathBuf>,
     /// Sandbox state directory (Codex-qualified). Same canonical-directory
     /// contract as [`Self::workspace_root`].
     pub codex_home: PathBuf,
@@ -154,12 +165,14 @@ pub struct WindowsSandboxLaunchPlan {
 }
 
 /// Parses the frozen CLI grammar:
-/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--sandbox-mode <workspace-write|read-only>] [--timeout-ms <n>] -- <command>...`
+/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--sandbox-mode <workspace-write|read-only>] [--timeout-ms <n>] [--extra-write-root <dir>]... -- <command>...`
 ///
 /// Syntax only; filesystem validation happens in
 /// [`build_launch_plan`]. No other flag exists on purpose:
-/// writable roots, policy JSON, network mode, and environment overrides are
-/// not caller-settable.
+/// policy JSON, network mode, and environment overrides are
+/// not caller-settable. The repeatable `--extra-write-root` is the only
+/// root-widening surface and exists exclusively for Host-projected,
+/// user-authorized write roots; it is rejected under `read-only`.
 pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, String> {
     let separator_index = raw_args
         .iter()
@@ -176,6 +189,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
     let mut timeout_ms: Option<u64> = None;
     let mut backend: Option<WindowsSandboxBackend> = None;
     let mut mode: Option<WindowsSandboxMode> = None;
+    let mut extra_write_roots: Vec<String> = Vec::new();
 
     let mut index = 0;
     while index < flags.len() {
@@ -184,6 +198,20 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
             "--workspace-root" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
                 replace_once(&mut workspace_root, value, flag)?;
+            }
+            "--extra-write-root" => {
+                let value = next_flag_value(flags, &mut index, flag)?.to_string();
+                if extra_write_roots.contains(&value) {
+                    return Err(format!(
+                        "duplicate value for {flag}: `{value}` (each extra root may appear once)"
+                    ));
+                }
+                if extra_write_roots.len() >= MAX_EXTRA_WRITE_ROOTS {
+                    return Err(format!(
+                        "too many {flag} values (at most {MAX_EXTRA_WRITE_ROOTS})"
+                    ));
+                }
+                extra_write_roots.push(value);
             }
             "--codex-home" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
@@ -234,10 +262,15 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
         workspace_root.ok_or_else(|| "missing required flag --workspace-root <dir>".to_string())?;
     let codex_home =
         codex_home.ok_or_else(|| "missing required flag --codex-home <dir>".to_string())?;
+    let mode = mode.unwrap_or_default();
+    if mode == WindowsSandboxMode::ReadOnly && !extra_write_roots.is_empty() {
+        return Err("--extra-write-root is incompatible with --sandbox-mode read-only".to_string());
+    }
     Ok(WindowsSandboxExecOptions {
         backend: backend.unwrap_or(WindowsSandboxBackend::Elevated),
-        mode: mode.unwrap_or_default(),
+        mode,
         workspace_root: PathBuf::from(workspace_root),
+        extra_write_roots: extra_write_roots.into_iter().map(PathBuf::from).collect(),
         codex_home: PathBuf::from(codex_home),
         timeout_ms,
     })
@@ -332,6 +365,25 @@ where
     if paths_overlap(&workspace_root, &codex_home) {
         return Err("--workspace-root and --codex-home must not overlap".to_string());
     }
+    // Extra write roots: same canonical-directory contract, plus pairwise and
+    // against-root overlap rejection so the ACL surface stays a disjoint set
+    // of user-authorized directories.
+    let mut extra_roots = Vec::with_capacity(options.extra_write_roots.len());
+    for raw in &options.extra_write_roots {
+        let extra = validate_canonical_directory(raw, "--extra-write-root")?;
+        if paths_overlap(&extra, &workspace_root)
+            || paths_overlap(&extra, &codex_home)
+            || extra_roots
+                .iter()
+                .any(|previous: &PathBuf| paths_overlap(previous, &extra))
+        {
+            return Err(format!(
+                "--extra-write-root must not overlap the workspace, the sandbox state root, or another extra root: `{}`",
+                raw.display()
+            ));
+        }
+        extra_roots.push(extra);
+    }
     let temp_parent = codex_home
         .parent()
         .ok_or_else(|| "--codex-home must have a parent directory".to_string())?;
@@ -342,6 +394,9 @@ where
     let command_temp_root = validate_canonical_directory(command_temp.path(), "managed TEMP")?;
     if paths_overlap(&workspace_root, &command_temp_root)
         || paths_overlap(&codex_home, &command_temp_root)
+        || extra_roots
+            .iter()
+            .any(|extra| paths_overlap(extra, &command_temp_root))
     {
         return Err(
             "managed TEMP must not overlap the workspace or sandbox state root".to_string(),
@@ -351,6 +406,22 @@ where
         .map_err(|err| format!("--workspace-root is not absolute: {err}"))?;
     let denied_codex_home = AbsolutePathBuf::from_absolute_path(&codex_home)
         .map_err(|err| format!("--codex-home is not absolute: {err}"))?;
+    let mut deny_write_paths = vec![denied_codex_home];
+    // Defense-in-depth carveouts on every user-authorized extra root: an
+    // existing `.git`/`.agents` directory stays read-only exactly like the
+    // workspace root's own copy. Only directories that already exist are
+    // pinned; the runner never fabricates paths inside a user directory.
+    for extra in &extra_roots {
+        for protected in [".git", ".agents"] {
+            let candidate = extra.join(protected);
+            if candidate.is_dir() {
+                deny_write_paths.push(
+                    AbsolutePathBuf::from_absolute_path(&candidate)
+                        .map_err(|err| format!("--extra-write-root is not absolute: {err}"))?,
+                );
+            }
+        }
+    }
     let permission_profile = match options.mode {
         WindowsSandboxMode::WorkspaceWrite => PermissionProfile::workspace_write(),
         WindowsSandboxMode::ReadOnly => PermissionProfile::read_only(),
@@ -359,17 +430,25 @@ where
     let managed_temp = command_temp_root.to_string_lossy().into_owned();
     env.push(("TEMP".to_string(), managed_temp.clone()));
     env.push(("TMP".to_string(), managed_temp));
+    let mut workspace_roots = Vec::with_capacity(extra_roots.len() + 1);
+    workspace_roots.push(absolute_root);
+    for extra in extra_roots {
+        workspace_roots.push(
+            AbsolutePathBuf::from_absolute_path(&extra)
+                .map_err(|err| format!("--extra-write-root is not absolute: {err}"))?,
+        );
+    }
     Ok(WindowsSandboxLaunchPlan {
         backend: options.backend,
         sandbox_mode: options.mode,
-        workspace_roots: vec![absolute_root],
+        workspace_roots,
         permission_profile,
         codex_home,
         command: command.to_vec(),
         cwd: workspace_root,
         env,
         command_temp_root,
-        deny_write_paths: vec![denied_codex_home],
+        deny_write_paths,
         timeout_ms: options.timeout_ms,
         _command_temp: command_temp,
     })
@@ -720,6 +799,101 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_accepts_repeatable_extra_write_roots_with_a_cap() {
+        let base = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+        ];
+        let args = base
+            .clone()
+            .into_iter()
+            .chain([
+                "--extra-write-root",
+                r"C:\wbgds",
+                "--extra-write-root",
+                r"C:\cache",
+                "--",
+                "cmd",
+            ])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let options = parse_cli(&args).unwrap();
+        assert_eq!(
+            options.extra_write_roots,
+            vec![PathBuf::from(r"C:\wbgds"), PathBuf::from(r"C:\cache")]
+        );
+        // The same root twice is rejected at parse time.
+        let duplicate = base
+            .clone()
+            .into_iter()
+            .chain([
+                "--extra-write-root",
+                r"C:\wbgds",
+                "--extra-write-root",
+                r"C:\wbgds",
+                "--",
+                "cmd",
+            ])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            parse_cli(&duplicate)
+                .unwrap_err()
+                .contains("duplicate value for --extra-write-root")
+        );
+        // The Host cap is re-checked by the grammar.
+        let too_many = base
+            .into_iter()
+            .chain([
+                "--extra-write-root",
+                "a",
+                "--extra-write-root",
+                "b",
+                "--extra-write-root",
+                "c",
+                "--extra-write-root",
+                "d",
+                "--extra-write-root",
+                "e",
+                "--",
+                "cmd",
+            ])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            parse_cli(&too_many)
+                .unwrap_err()
+                .contains("too many --extra-write-root")
+        );
+    }
+
+    #[test]
+    fn parse_cli_rejects_extra_write_roots_under_read_only() {
+        let args = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+            "--sandbox-mode",
+            "read-only",
+            "--extra-write-root",
+            r"C:\wbgds",
+            "--",
+            "cmd",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        let error = parse_cli(&args).unwrap_err();
+        assert!(
+            error.contains("--extra-write-root is incompatible"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
     fn parse_cli_accepts_only_the_closed_sandbox_mode_values() {
         let base = [
             "--workspace-root",
@@ -806,6 +980,7 @@ mod tests {
                 backend: WindowsSandboxBackend::Elevated,
                 mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.to_path_buf(),
+                extra_write_roots: Vec::new(),
                 codex_home: home.to_path_buf(),
                 timeout_ms: None,
             }
@@ -935,6 +1110,7 @@ mod tests {
                 backend: WindowsSandboxBackend::Elevated,
                 mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.join("sub").join(".."),
+                extra_write_roots: Vec::new(),
                 codex_home,
                 timeout_ms: None,
             };
@@ -993,6 +1169,89 @@ mod tests {
             );
             assert_eq!(request.read_roots_override, Some([].as_slice()));
             assert_eq!(request.deny_write_paths_override, plan.deny_write_paths);
+        }
+
+        #[test]
+        fn launch_plan_appends_canonical_extra_write_roots() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let (_extra_keep, extra) = canonical_temp_dir();
+            let mut options = options_for(&root, &codex_home);
+            options.extra_write_roots = vec![extra.clone()];
+            let plan = build_launch_plan(&options, &sample_command(), parent_env()).unwrap();
+            // Main root first, extras after; the profile stays frozen.
+            assert_eq!(plan.workspace_roots.len(), 2);
+            assert_eq!(plan.workspace_roots[0].as_path(), root);
+            assert_eq!(plan.workspace_roots[1].as_path(), extra);
+            assert_eq!(
+                plan.permission_profile,
+                PermissionProfile::workspace_write()
+            );
+            // Multi-root permissions must still resolve for the sandbox.
+            let resolved =
+                codex_windows_sandbox::ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+                    &plan.permission_profile,
+                    &plan.workspace_roots,
+                );
+            assert!(resolved.is_ok(), "extra-root profile must be enforceable");
+            // The session request carries the widened root set verbatim.
+            let request = build_session_request(&plan);
+            assert_eq!(request.workspace_roots.len(), 2);
+            // Only the codex-home deny when no `.git`/`.agents` exists.
+            assert_eq!(plan.deny_write_paths.len(), 1);
+        }
+
+        #[test]
+        fn launch_plan_pins_existing_git_and_agents_dirs_in_extra_roots() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let (_extra_keep, extra) = canonical_temp_dir();
+            std::fs::create_dir_all(extra.join(".git")).expect("create .git");
+            let mut options = options_for(&root, &codex_home);
+            options.extra_write_roots = vec![extra.clone()];
+            let plan = build_launch_plan(&options, &sample_command(), parent_env()).unwrap();
+            let denied: Vec<_> = plan
+                .deny_write_paths
+                .iter()
+                .map(|path| path.as_path().to_path_buf())
+                .collect();
+            assert!(
+                denied.contains(&extra.join(".git")),
+                "existing .git in an extra root must be write-denied: {denied:?}"
+            );
+            assert!(
+                !denied.contains(&extra.join(".agents")),
+                "non-existing .agents must not be fabricated"
+            );
+        }
+
+        #[test]
+        fn launch_plan_rejects_extra_roots_overlapping_any_other_root() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let (_extra_keep, extra) = canonical_temp_dir();
+            let mut options = options_for(&root, &codex_home);
+            // Overlaps the workspace root.
+            options.extra_write_roots = vec![root];
+            let error = build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
+            assert!(
+                error.contains("must not overlap"),
+                "workspace overlap must be rejected: {error}"
+            );
+            // Overlaps codex-home.
+            options.extra_write_roots = vec![codex_home];
+            let error = build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
+            assert!(error.contains("must not overlap"));
+            // Pairwise overlap: two distinct raw paths that canonicalize into
+            // an ancestor/descendant relationship.
+            let child = extra.join("child");
+            std::fs::create_dir_all(&child).expect("create child");
+            options.extra_write_roots = vec![extra, child];
+            let error = build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
+            assert!(
+                error.contains("must not overlap"),
+                "nested extras must be rejected: {error}"
+            );
         }
     }
 }

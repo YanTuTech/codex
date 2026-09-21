@@ -122,6 +122,14 @@ pub struct WindowsSandboxExecOptions {
     /// the sandbox state root, or each other. Under `read-only` the grammar
     /// rejects them outright: the no-writable-root property is never widened.
     pub extra_write_roots: Vec<PathBuf>,
+    /// Optional Host-projected working directory for the sandboxed command,
+    /// workspace-relative and forward-slash separated (`.` = root). Syntax
+    /// only here; [`build_launch_plan`] resolves it under the canonical
+    /// workspace root and refuses to launch the command body when the
+    /// directory is missing, not a directory, or escapes the root
+    /// (`cwd-inaccessible` / `cwd-invalid`). The command body can never run
+    /// in a different directory than the Host authorized.
+    pub cwd_relative: Option<String>,
     /// Sandbox state directory (Codex-qualified). Same canonical-directory
     /// contract as [`Self::workspace_root`].
     pub codex_home: PathBuf,
@@ -150,7 +158,8 @@ pub struct WindowsSandboxLaunchPlan {
     /// The sandboxed command argv.
     pub command: Vec<String>,
     /// Working directory of the sandboxed command: the canonical workspace
-    /// root.
+    /// root, or the Host-projected `--cwd-relative` directory resolved and
+    /// validated inside it.
     pub cwd: PathBuf,
     /// Filtered environment (fixed allowlist only).
     pub env: Vec<(String, String)>,
@@ -165,7 +174,7 @@ pub struct WindowsSandboxLaunchPlan {
 }
 
 /// Parses the frozen CLI grammar:
-/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--sandbox-mode <workspace-write|read-only>] [--timeout-ms <n>] [--extra-write-root <dir>]... -- <command>...`
+/// `--workspace-root <dir> --codex-home <dir> [--backend <elevated|restricted-token>] [--sandbox-mode <workspace-write|read-only>] [--cwd-relative <dir>] [--timeout-ms <n>] [--extra-write-root <dir>]... -- <command>...`
 ///
 /// Syntax only; filesystem validation happens in
 /// [`build_launch_plan`]. No other flag exists on purpose:
@@ -173,6 +182,8 @@ pub struct WindowsSandboxLaunchPlan {
 /// not caller-settable. The repeatable `--extra-write-root` is the only
 /// root-widening surface and exists exclusively for Host-projected,
 /// user-authorized write roots; it is rejected under `read-only`.
+/// `--cwd-relative` is Host-projected too: the working directory of the
+/// sandboxed command, resolved strictly inside the workspace root.
 pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, String> {
     let separator_index = raw_args
         .iter()
@@ -190,6 +201,7 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
     let mut backend: Option<WindowsSandboxBackend> = None;
     let mut mode: Option<WindowsSandboxMode> = None;
     let mut extra_write_roots: Vec<String> = Vec::new();
+    let mut cwd_relative: Option<String> = None;
 
     let mut index = 0;
     while index < flags.len() {
@@ -198,6 +210,11 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
             "--workspace-root" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
                 replace_once(&mut workspace_root, value, flag)?;
+            }
+            "--cwd-relative" => {
+                let value = next_flag_value(flags, &mut index, flag)?.to_string();
+                validate_relative_cwd_syntax(&value)?;
+                replace_once(&mut cwd_relative, value, flag)?;
             }
             "--extra-write-root" => {
                 let value = next_flag_value(flags, &mut index, flag)?.to_string();
@@ -271,9 +288,42 @@ pub fn parse_cli(raw_args: &[String]) -> Result<WindowsSandboxExecOptions, Strin
         mode,
         workspace_root: PathBuf::from(workspace_root),
         extra_write_roots: extra_write_roots.into_iter().map(PathBuf::from).collect(),
+        cwd_relative,
         codex_home: PathBuf::from(codex_home),
         timeout_ms,
     })
+}
+
+/// `--cwd-relative` syntax gate: forward-slash separated workspace-relative
+/// path (`.` = root), bounded, without drive letters, backslashes, empty,
+/// `.`, or `..` components. Filesystem resolution happens in
+/// [`build_launch_plan`] so the failure reasons stay distinguishable.
+fn validate_relative_cwd_syntax(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 1024 {
+        return Err(
+            "invalid value for --cwd-relative: bounded non-empty path expected".to_string(),
+        );
+    }
+    if value.starts_with('/') || value.starts_with('\\') || value.contains('\\') {
+        return Err(
+            "invalid value for --cwd-relative: forward-slash relative path expected".to_string(),
+        );
+    }
+    if value.len() >= 2 && value.as_bytes()[1] == b':' {
+        return Err(
+            "invalid value for --cwd-relative: drive-qualified paths are rejected".to_string(),
+        );
+    }
+    if value != "." {
+        for part in value.split('/') {
+            if part.is_empty() || part == "." || part == ".." {
+                return Err(format!(
+                    "invalid value for --cwd-relative: plain segments expected, got `{value}`"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn next_flag_value<'a>(
@@ -365,6 +415,34 @@ where
     if paths_overlap(&workspace_root, &codex_home) {
         return Err("--workspace-root and --codex-home must not overlap".to_string());
     }
+    // Host-projected working directory: resolved under the canonical
+    // workspace root. Every failure here runs BEFORE the sandboxed command
+    // body exists, so a broken cwd can never degrade into running the
+    // command somewhere else.
+    let cwd = match &options.cwd_relative {
+        None => workspace_root.clone(),
+        Some(relative) => {
+            let joined = if relative == "." {
+                workspace_root.clone()
+            } else {
+                workspace_root.join(relative.replace('/', "\\"))
+            };
+            let canonical = dunce::canonicalize(&joined).map_err(|_| {
+                format!("cwd-inaccessible: --cwd-relative `{relative}` cannot be opened inside the workspace root")
+            })?;
+            if !canonical.starts_with(&workspace_root) {
+                return Err(format!(
+                    "cwd-invalid: --cwd-relative `{relative}` escapes the workspace root"
+                ));
+            }
+            if !canonical.is_dir() {
+                return Err(format!(
+                    "cwd-inaccessible: --cwd-relative `{relative}` is not a directory"
+                ));
+            }
+            canonical
+        }
+    };
     // Extra write roots: same canonical-directory contract, plus pairwise and
     // against-root overlap rejection so the ACL surface stays a disjoint set
     // of user-authorized directories.
@@ -445,7 +523,7 @@ where
         permission_profile,
         codex_home,
         command: command.to_vec(),
-        cwd: workspace_root,
+        cwd,
         env,
         command_temp_root,
         deny_write_paths,
@@ -894,6 +972,86 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_accepts_and_bounds_the_cwd_relative_flag() {
+        let base = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+        ];
+        let with_cwd = base
+            .into_iter()
+            .chain(["--cwd-relative", "mask/layout", "--", "cmd"])
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&with_cwd).unwrap().cwd_relative.as_deref(),
+            Some("mask/layout")
+        );
+        // `.` is the explicit workspace root.
+        let root_cwd = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+            "--cwd-relative",
+            ".",
+            "--",
+            "cmd",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            parse_cli(&root_cwd).unwrap().cwd_relative.as_deref(),
+            Some(".")
+        );
+        // Escaping, absolute, drive-qualified, backslash, and empty values
+        // all reject before the filesystem is touched.
+        for hostile in ["..", "a/../b", "a/./b", "/abs", r"C:\elsewhere", r"a\b", ""] {
+            let invalid = [
+                "--workspace-root",
+                r"C:\workspace",
+                "--codex-home",
+                r"C:\codex-home",
+                "--cwd-relative",
+                hostile,
+                "--",
+                "cmd",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+            let error = parse_cli(&invalid).unwrap_err();
+            assert!(
+                error.contains("invalid value for --cwd-relative"),
+                "value {hostile:?} must be rejected; got: {error}"
+            );
+        }
+        // Duplicates reject like every other single-value flag.
+        let duplicate = [
+            "--workspace-root",
+            r"C:\workspace",
+            "--codex-home",
+            r"C:\codex-home",
+            "--cwd-relative",
+            "a",
+            "--cwd-relative",
+            "b",
+            "--",
+            "cmd",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        assert!(
+            parse_cli(&duplicate)
+                .unwrap_err()
+                .contains("duplicate flag --cwd-relative")
+        );
+    }
+
+    #[test]
     fn parse_cli_accepts_only_the_closed_sandbox_mode_values() {
         let base = [
             "--workspace-root",
@@ -981,6 +1139,7 @@ mod tests {
                 mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.to_path_buf(),
                 extra_write_roots: Vec::new(),
+                cwd_relative: None,
                 codex_home: home.to_path_buf(),
                 timeout_ms: None,
             }
@@ -1103,6 +1262,45 @@ mod tests {
         }
 
         #[test]
+        fn launch_plan_resolves_cwd_relative_inside_the_workspace_root() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            std::fs::create_dir(root.join("mask")).expect("create mask dir");
+            let mut options = options_for(&root, &codex_home);
+            options.cwd_relative = Some("mask".to_string());
+            let plan = build_launch_plan(&options, &sample_command(), parent_env()).unwrap();
+            assert_eq!(plan.cwd, root.join("mask"));
+            // `.` keeps the workspace root as the working directory.
+            let mut root_options = options_for(&root, &codex_home);
+            root_options.cwd_relative = Some(".".to_string());
+            let root_plan =
+                build_launch_plan(&root_options, &sample_command(), parent_env()).unwrap();
+            assert_eq!(root_plan.cwd, root);
+        }
+
+        #[test]
+        fn launch_plan_refuses_a_missing_or_escaping_cwd_before_any_spawn() {
+            let (_workspace, root) = canonical_temp_dir();
+            let (_home, codex_home) = canonical_temp_dir();
+            let mut options = options_for(&root, &codex_home);
+            options.cwd_relative = Some("missing-subdir".to_string());
+            let error = build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
+            assert!(
+                error.starts_with("cwd-inaccessible"),
+                "a missing cwd must refuse launch; got: {error}"
+            );
+            // A regular file in the cwd position is not a directory.
+            std::fs::write(root.join("notes.txt"), b"x").expect("write file");
+            options.cwd_relative = Some("notes.txt".to_string());
+            let file_error =
+                build_launch_plan(&options, &sample_command(), parent_env()).unwrap_err();
+            assert!(
+                file_error.starts_with("cwd-inaccessible"),
+                "a file cwd must refuse launch; got: {file_error}"
+            );
+        }
+
+        #[test]
         fn launch_plan_revalidates_canonical_roots() {
             let (_workspace, root) = canonical_temp_dir();
             let (_home, codex_home) = canonical_temp_dir();
@@ -1111,6 +1309,7 @@ mod tests {
                 mode: WindowsSandboxMode::WorkspaceWrite,
                 workspace_root: root.join("sub").join(".."),
                 extra_write_roots: Vec::new(),
+                cwd_relative: None,
                 codex_home,
                 timeout_ms: None,
             };

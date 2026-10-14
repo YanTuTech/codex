@@ -998,7 +998,10 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         sandbox_group_sid,
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        // The caller owns untrusted request/attempt files and must atomically
+        // rename and remove them. This adds no FILE_DELETE_CHILD authority;
+        // the administrator-owned receipt subtree has its own protected ACL.
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         payload.mode,
     )
     .map_err(|err| {
@@ -1684,6 +1687,71 @@ mod tests {
             "proxy_ports": [],
             "real_user": "User",
         })
+    }
+
+    #[test]
+    fn control_request_file_can_be_published_and_removed_after_directory_lock() {
+        let temp = tempfile::tempdir().expect("temporary control home");
+        let mut payload: Payload = serde_json::from_value(payload_json()).expect("payload");
+        payload.codex_home = temp.path().to_path_buf();
+        payload.real_user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").expect("domain"),
+            std::env::var("USERNAME").expect("user")
+        );
+        let dir = codex_windows_sandbox::sandbox_dir(temp.path());
+        fs::create_dir_all(&dir).expect("control directory");
+        // Match an existing protected control directory: inherited parent
+        // FullControl must not mask the helper's effective caller rights.
+        unsafe {
+            use windows_sys::Win32::Security::Authorization::{
+                GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            };
+            use windows_sys::Win32::Security::{
+                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut dacl = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            assert_eq!(
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor
+                ),
+                0
+            );
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            LocalFree(descriptor as _);
+        }
+        let system_sid = super::resolve_sid("SYSTEM").expect("system SID");
+        super::lock_persistent_sandbox_dirs(&payload, &system_sid).expect("control-directory ACL");
+        let source = dir.join("private-request.tmp");
+        let published = dir.join("setup-request-v1.json");
+        fs::write(&source, "untrusted request fixture").expect("create own request");
+        fs::rename(&source, &published).expect("atomic publication of own request");
+        fs::remove_file(&published).expect("cleanup own request");
     }
 
     #[test]

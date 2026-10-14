@@ -238,7 +238,63 @@ pub fn write_receipt_and_consume_request(
 /// (never an ambiguous account name). Fail-closed: any failure or read-back
 /// mismatch is an error and NO receipt may be written afterwards.
 #[cfg(windows)]
+fn receipt_directory_owned_by_administrators(dir: &Path) -> Result<bool> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    unsafe {
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let result = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if result != 0 {
+            bail!("read receipt directory owner failed with {result:#x}");
+        }
+        let mut text = std::ptr::null_mut();
+        let converted = ConvertSidToStringSidW(owner, &mut text);
+        let owned = if converted != 0 && !text.is_null() {
+            let mut len = 0;
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(text, len))
+                .ok()
+                .as_deref()
+                == Some("S-1-5-32-544")
+        } else {
+            false
+        };
+        if !text.is_null() {
+            LocalFree(text as _);
+        }
+        LocalFree(descriptor as _);
+        if converted == 0 {
+            bail!("read receipt directory owner SID failed");
+        }
+        Ok(owned)
+    }
+}
+
+#[cfg(windows)]
 fn protect_receipt_directory(dir: &Path, real_user_sid: &str) -> Result<()> {
+    if !crate::setup::is_elevated()? {
+        bail!("receipt protection requires an elevated administrator token");
+    }
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::ACL;
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -257,6 +313,10 @@ fn protect_receipt_directory(dir: &Path, real_user_sid: &str) -> Result<()> {
     const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
     const SYSTEM_SID: &str = "S-1-5-18";
 
+    // Elevated-created directories already belong to Administrators. Requesting
+    // WRITE_OWNER again can fail after the parent ACL has been narrowed to
+    // Modify. Retain exact owner read-back; only avoid the redundant write.
+    let owner_already_administrators = receipt_directory_owned_by_administrators(dir)?;
     unsafe {
         let sid_from_string = |value: &str| -> Result<windows_sys::Win32::Foundation::PSID> {
             let wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
@@ -323,10 +383,18 @@ fn protect_receipt_directory(dir: &Path, real_user_sid: &str) -> Result<()> {
         let set_result = SetNamedSecurityInfoW(
             dir_w.as_ptr(),
             SE_FILE_OBJECT,
-            windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION
-                | windows_sys::Win32::Security::DACL_SECURITY_INFORMATION
-                | windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION,
-            admins,
+            windows_sys::Win32::Security::DACL_SECURITY_INFORMATION
+                | windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION
+                | if owner_already_administrators {
+                    0
+                } else {
+                    windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION
+                },
+            if owner_already_administrators {
+                std::ptr::null_mut()
+            } else {
+                admins
+            },
             std::ptr::null_mut(),
             new_dacl,
             std::ptr::null_mut(),
@@ -560,6 +628,76 @@ mod tests {
         let dir_three = tempfile::tempdir().unwrap();
         write_request(dir_three.path(), &valid_request(&id));
         assert!(read_setup_request(dir_three.path(), &id, "not-a-timestamp").is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn receipt_protection_reapplies_without_redundant_owner_write() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT,
+            SetNamedSecurityInfoW,
+        };
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("receipt");
+        std::fs::create_dir(&dir).unwrap();
+        let admin_owned = receipt_directory_owned_by_administrators(&dir).unwrap();
+        unsafe {
+            let sddl: Vec<u16> = "D:(A;OICI;0x1301bf;;;BA)(A;OICI;0x1301bf;;;SY)(A;OICI;GR;;;WD)"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut descriptor = std::ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            let mut dacl = std::ptr::null_mut();
+            let mut present = 0;
+            let mut defaulted = 0;
+            assert_ne!(
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            LocalFree(descriptor as _);
+        }
+        let result = protect_receipt_directory(&dir, "S-1-1-0");
+        if admin_owned {
+            result.unwrap();
+            verify_receipt_directory_protection(&dir, "S-1-1-0").unwrap();
+        } else {
+            // A medium token still cannot turn its user-owned directory into
+            // an administrator-owned authority or mint a trusted receipt.
+            assert!(result.is_err());
+            assert!(!receipt_directory_owned_by_administrators(&dir).unwrap());
+        }
     }
 
     #[test]

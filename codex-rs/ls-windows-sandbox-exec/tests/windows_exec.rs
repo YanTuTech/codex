@@ -1,10 +1,12 @@
 //! CLI and runner-contract tests for `ls-windows-sandbox-exec`.
 //!
 //! The runner contract is frozen: exactly one canonical workspace root, one
-//! canonical sandbox state directory, an optional positive `--timeout-ms`,
-//! and the command after `--`. Anything else — writable-root overrides,
-//! policy JSON, network flags, environment overrides — must be rejected as
-//! unknown arguments, and every runner-own failure must be a single
+//! canonical sandbox state directory, an optional `--backend`
+//! `<elevated|restricted-token>`, an optional closed `--sandbox-mode`
+//! `<workspace-write|read-only>`, an optional positive `--timeout-ms`, and
+//! the command after `--`. Anything else — writable-root overrides, policy
+//! JSON, network flags, environment overrides — must be rejected as unknown
+//! arguments, and every runner-own failure must be a single
 //! `LS_WINDOWS_SANDBOX_UNAVAILABLE:<reason>` stderr line with exit 250.
 //!
 //! The `containment_matrix` module additionally runs the native Windows
@@ -367,6 +369,8 @@ fn arbitrary_policy_and_root_flags_are_rejected() {
         "--sandbox-policy-file",
         "--set",
         "--danger-full-access",
+        "--mode",
+        "--permission-profile",
     ] {
         let mut args = valid_prefix(&workspace_root, &codex_home);
         args.push(hostile.to_string());
@@ -376,6 +380,46 @@ fn arbitrary_policy_and_root_flags_are_rejected() {
         let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
         assert_runner_failure(&output, "unknown argument");
     }
+}
+
+#[test]
+fn sandbox_mode_accepts_only_the_closed_values() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    // Closed enum: anything outside workspace-write/read-only is rejected.
+    for hostile in ["readonly", "read_only", "danger-full-access", "workspace"] {
+        let mut args = valid_prefix(&workspace_root, &codex_home);
+        args.push("--sandbox-mode".to_string());
+        args.push(hostile.to_string());
+        args.push("--".to_string());
+        args.push("cmd".to_string());
+        let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_runner_failure(&output, "invalid value for --sandbox-mode");
+    }
+}
+
+#[test]
+fn duplicate_sandbox_mode_is_rejected() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    let mut args = valid_prefix(&workspace_root, &codex_home);
+    args.push("--sandbox-mode".to_string());
+    args.push("read-only".to_string());
+    args.push("--sandbox-mode".to_string());
+    args.push("workspace-write".to_string());
+    args.push("--".to_string());
+    args.push("cmd".to_string());
+    let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_runner_failure(&output, "duplicate flag --sandbox-mode");
+}
+
+#[test]
+fn missing_sandbox_mode_value_is_rejected() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    let mut args = valid_prefix(&workspace_root, &codex_home);
+    args.push("--sandbox-mode".to_string());
+    args.push("--".to_string());
+    args.push("cmd".to_string());
+    let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_runner_failure(&output, "--sandbox-mode");
 }
 
 #[test]
@@ -403,6 +447,112 @@ fn non_windows_host_fails_closed_even_with_valid_arguments() {
     args.push("cmd".to_string());
     let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert_runner_failure(&output, "Windows");
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[allow(clippy::unwrap_used)] // native qualification: every failed observation is the assertion
+fn restricted_token_backend_writes_only_the_workspace_and_marks_environment_offline() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    let (external, external_root) = canonical_temp_dir();
+    let workspace_file = workspace_root.join("inside.txt");
+    let external_file = external_root.join("outside.txt");
+    let script = format!(
+        "echo INSIDE>\"{}\" & echo OUTSIDE>\"{}\" & echo NONET=%SBX_NONET_ACTIVE%",
+        workspace_file.display(),
+        external_file.display()
+    );
+    let mut args = valid_prefix(&workspace_root, &codex_home);
+    args.extend([
+        "--backend".to_string(),
+        "restricted-token".to_string(),
+        "--".to_string(),
+        "cmd".to_string(),
+        "/d".to_string(),
+        "/s".to_string(),
+        "/c".to_string(),
+        script,
+    ]);
+    let output = run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(
+        output.status.success(),
+        "restricted-token runner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(workspace_file.exists(), "workspace write was not admitted");
+    assert!(
+        !external_file.exists(),
+        "restricted-token backend wrote outside the workspace"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("NONET=1"),
+        "restricted-token backend did not expose its environment-offline marker"
+    );
+    drop(external);
+}
+
+/// Native read-only qualification on the restricted-token backend (no
+/// administrator consent): the command still executes and reads stay
+/// available, but every write is denied — including inside the workspace and
+/// into the runner-managed TEMP/TMP root.
+#[cfg(target_os = "windows")]
+#[test]
+#[allow(clippy::unwrap_used)] // native qualification: every failed observation is the assertion
+fn read_only_mode_executes_but_denies_every_write_including_workspace_and_temp() {
+    let (_workspace, workspace_root, _home, codex_home) = root_and_home();
+    std::fs::write(workspace_root.join("seed.txt"), b"readable").unwrap();
+    let workspace_probe = workspace_root.join("write-probe.txt");
+    // Each probe is its own invocation: cmd chains `&` into the first `if`
+    // body, so separate scripts keep the observations exact. All three
+    // scripts must observe the write failing while reads keep working.
+    let run_read_only = |script: String| {
+        let mut args = valid_prefix(&workspace_root, &codex_home);
+        args.extend([
+            "--backend".to_string(),
+            "restricted-token".to_string(),
+            "--sandbox-mode".to_string(),
+            "read-only".to_string(),
+            "--".to_string(),
+            "cmd".to_string(),
+            "/d".to_string(),
+            "/s".to_string(),
+            "/c".to_string(),
+            script,
+        ]);
+        run_runner(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    // 1. Reads and execution still work in read-only mode.
+    let read = run_read_only("type seed.txt".to_string());
+    assert!(
+        String::from_utf8_lossy(&read.stdout).contains("readable"),
+        "read-only mode must still execute commands and read the workspace; stderr: {}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    // 2. Writes inside the workspace are denied and do not land.
+    let inside = run_read_only(format!("echo denied>\"{}\"", workspace_probe.display()));
+    assert!(
+        inside.status.code().is_some_and(|code| code != 0),
+        "read-only workspace write must fail; stderr: {}",
+        String::from_utf8_lossy(&inside.stderr)
+    );
+    assert!(
+        !workspace_probe.exists(),
+        "read-only workspace write must not land"
+    );
+    // 3. Writes into the runner-managed TEMP/TMP root are denied too. The
+    // managed root is runner-private and cleaned up afterwards, so the
+    // observable contract is the command's exit code: a successful write
+    // into %TEMP% would exit 0.
+    let temp = run_read_only("echo denied>\"%TEMP%\\ls-sbx-ro-probe.txt\"".to_string());
+    assert!(
+        temp.status.code().is_some_and(|code| code != 0),
+        "read-only TEMP write must fail; stderr: {}",
+        String::from_utf8_lossy(&temp.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&temp.stdout).contains("denied"),
+        "the redirected write must not have produced output"
+    );
 }
 
 /// Native Windows containment matrix (Task 4).
@@ -546,6 +696,10 @@ mod containment_matrix {
             self.run(&["--", "cmd", "/c", script])
         }
 
+        fn run_read_only_cmd(&self, script: &str) -> Output {
+            self.run(&["--sandbox-mode", "read-only", "--", "cmd", "/c", script])
+        }
+
         fn external_unchanged(&self) -> bool {
             std::fs::read(&self.external_file).unwrap() == b"original"
         }
@@ -590,6 +744,52 @@ mod containment_matrix {
             Some(0),
             "writes into the Codex-qualified TEMP root must succeed"
         );
+    }
+
+    /// Read-only mode on the elevated backend: commands execute, reads work,
+    /// and every write is denied — the workspace, the runner-managed TEMP
+    /// root, and external targets alike.
+    #[test]
+    fn read_only_mode_executes_reads_and_denies_all_writes() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.workspace.join("seed.txt"), b"matrix-readable").unwrap();
+        let workspace_probe = fixture.workspace.join("ro-write-probe.txt");
+
+        let read = fixture.run_read_only_cmd("type seed.txt");
+        assert_eq!(
+            read.status.code(),
+            Some(0),
+            "read-only mode must still execute and read; stderr: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&read.stdout).contains("matrix-readable"),
+            "read-only reads must be forwarded"
+        );
+
+        let inside = fixture.run_read_only_cmd("echo denied > ro-write-probe.txt");
+        assert!(
+            inside.status.code().is_some_and(|code| code != 0),
+            "read-only workspace write must fail; stderr: {}",
+            String::from_utf8_lossy(&inside.stderr)
+        );
+        assert!(
+            !workspace_probe.exists(),
+            "read-only workspace write must not land"
+        );
+
+        let temp = fixture.run_read_only_cmd("echo denied > %TEMP%\\ls-sbx-ro-matrix.txt");
+        assert!(
+            temp.status.code().is_some_and(|code| code != 0),
+            "read-only TEMP write must fail; stderr: {}",
+            String::from_utf8_lossy(&temp.stderr)
+        );
+
+        let external = fixture.run_read_only_cmd(&format!(
+            "echo denied > {}",
+            fixture.external_file.display()
+        ));
+        assert_external_denied(&external, &fixture, "read-only external write");
     }
 
     #[test]
@@ -1216,10 +1416,18 @@ mod containment_matrix {
     }
 
     #[test]
-    fn external_public_read_matches_workspace_write_policy() {
+    fn external_user_profile_read_is_denied() {
         let fixture = Fixture::new();
-        assert_eq!(std::fs::read(&fixture.external_file).unwrap(), b"original");
-        let victim = fixture.external_file.to_string_lossy().to_string();
+        let profile = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
+        let private = tempfile::Builder::new()
+            .prefix("ls-d8-read-canary-")
+            .tempfile_in(profile.join("AppData").join("Local"))
+            .unwrap();
+        std::fs::write(private.path(), b"synthetic-d8-canary").unwrap();
+        let victim = dunce::canonicalize(private.path())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let nonce = fixture
             .workspace
             .parent()
@@ -1228,9 +1436,9 @@ mod containment_matrix {
             .unwrap()
             .to_string_lossy();
         let code = format!(
-            "import sys; print('START-{nonce}', flush=True); data = open(r'{victim}', 'rb').read(); print('READ-{nonce}' if data == b'original' else 'WRONG'); sys.exit(0 if data == b'original' else 3)"
+            "import sys\nprint('START-{nonce}', flush=True)\ntry:\n data = open(r'{victim}', 'rb').read()\nexcept PermissionError:\n print('DENIED-{nonce}', flush=True)\n sys.exit(23)\nprint('READ-{nonce}' if data == b'synthetic-d8-canary' else 'WRONG', flush=True)\nsys.exit(0 if data == b'synthetic-d8-canary' else 3)"
         );
-        let expected = format!("START-{nonce}\nREAD-{nonce}\n");
+        let host_expected = format!("START-{nonce}\nREAD-{nonce}\n");
         let host = Command::new("python").args(["-c", &code]).output().unwrap();
         assert_eq!(
             host.status.code(),
@@ -1239,17 +1447,21 @@ mod containment_matrix {
         );
         assert_eq!(
             String::from_utf8_lossy(&host.stdout).replace("\r\n", "\n"),
-            expected
+            host_expected
         );
         let read = run_tool(&fixture, "python", &["-c", &code]);
         assert_eq!(
             read.status.code(),
-            Some(0),
-            "ordinary external read: {read:?}"
+            Some(23),
+            "AppData read must be denied by the sandbox identity: {read:?}"
         );
         assert_eq!(
             String::from_utf8_lossy(&read.stdout).replace("\r\n", "\n"),
-            expected
+            format!("START-{nonce}\nDENIED-{nonce}\n")
+        );
+        assert_eq!(
+            std::fs::read(private.path()).unwrap(),
+            b"synthetic-d8-canary"
         );
     }
 

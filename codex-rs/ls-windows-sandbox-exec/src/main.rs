@@ -4,6 +4,9 @@
 //! ```text
 //! ls-windows-sandbox-exec --workspace-root <canonical-directory>
 //!                         --codex-home <sandbox-state-directory>
+//!                         [--backend <elevated|restricted-token>]
+//!                         [--sandbox-mode <workspace-write|read-only>]
+//!                         [--cwd-relative <workspace-relative-directory>]
 //!                         [--timeout-ms <positive-integer>]
 //!                         -- <command> [args...]
 //! ```

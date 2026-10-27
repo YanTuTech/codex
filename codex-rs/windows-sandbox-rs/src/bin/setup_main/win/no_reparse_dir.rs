@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use anyhow::ensure;
-use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
@@ -23,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -89,13 +89,7 @@ pub(super) fn open_existing_no_reparse(path: &Path, access: u32) -> Result<Owned
     )
 }
 
-fn open_no_reparse(
-    path: &Path,
-    access: u32,
-    disposition: u32,
-    options: u32,
-    share: u32,
-) -> Result<OwnedHandle> {
+fn local_path_nt_path(path: &Path) -> Result<Vec<u16>> {
     ensure!(
         path.is_absolute(),
         "sandbox ACL path must be absolute: {}",
@@ -109,12 +103,28 @@ fn open_no_reparse(
             path.display()
         ),
     };
-    // NtCreateFile expects an NT namespace path. Convert only the local-disk
-    // spellings accepted by provisioning, without canonicalizing and following
-    // the reparse points that OBJ_DONT_REPARSE must reject.
+    // Windows 10 also rejects the Object Manager drive-letter link under
+    // OBJ_DONT_REPARSE. Resolve that alias only; never canonicalize filesystem
+    // components, which must still be checked by NtCreateFile.
     let source: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let mut nt_path: Vec<u16> = OsStr::new("\\??\\").encode_wide().collect();
-    for unit in source.into_iter().skip(source_offset) {
+    let drive = [source[source_offset], b':' as u16, 0];
+    let mut nt_path = vec![0_u16; 32_768];
+    let length =
+        unsafe { QueryDosDeviceW(drive.as_ptr(), nt_path.as_mut_ptr(), nt_path.len() as u32) };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error()).context("resolve sandbox ACL drive");
+    }
+    nt_path.truncate(
+        nt_path
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(length as usize),
+    );
+    ensure!(
+        is_disk_volume(&nt_path),
+        "sandbox ACL drive must resolve directly to a disk volume"
+    );
+    for unit in source.into_iter().skip(source_offset + 2) {
         nt_path.push(if unit == b'/' as u16 {
             b'\\' as u16
         } else {
@@ -122,6 +132,34 @@ fn open_no_reparse(
         });
     }
     nt_path.push(0);
+    Ok(nt_path)
+}
+
+fn is_disk_volume(target: &[u16]) -> bool {
+    let Some((prefix, number)) = target.split_at_checked(br"\Device\HarddiskVolume".len()) else {
+        return false;
+    };
+    // Do not pass other devices or volume subpaths to NtCreateFile.
+    prefix
+        .iter()
+        .zip(br"\Device\HarddiskVolume")
+        .all(|(&unit, expected)| {
+            u8::try_from(unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(expected))
+        })
+        && !number.is_empty()
+        && number
+            .iter()
+            .all(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
+}
+
+fn open_no_reparse(
+    path: &Path,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    share: u32,
+) -> Result<OwnedHandle> {
+    let mut nt_path = local_path_nt_path(path)?;
     let name_length = u16::try_from((nt_path.len() - 1) * size_of::<u16>())
         .context("sandbox ACL path is too long")?;
     let maximum_length =

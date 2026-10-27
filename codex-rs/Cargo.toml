@@ -94,6 +94,7 @@ members = [
     "response-debug-context",
     "rb-launch-guard",
     "rb-sandbox-exec",
+    "ls-windows-sandbox-exec",
     "sandboxing",
     "stdio-to-uds",
     "otel",

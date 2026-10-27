@@ -45,12 +45,21 @@ pub struct WindowsSandboxSessionRequest<'a> {
     pub tty: bool,
     pub stdin_open: bool,
     pub use_private_desktop: bool,
+    /// Whether descendants may continue after the root command exits normally.
+    /// One-shot tool runners set this to false so inherited output handles
+    /// cannot keep the tool call alive indefinitely.
+    pub preserve_descendants_on_root_exit: bool,
 }
 
 pub async fn spawn_windows_sandbox_session_for_level(
     request: WindowsSandboxSessionRequest<'_>,
 ) -> Result<SpawnedProcess> {
     if matches!(request.windows_sandbox_level, WindowsSandboxLevel::Elevated) {
+        if !request.preserve_descendants_on_root_exit {
+            bail!(
+                "terminating descendants on root exit is not supported by the elevated Windows sandbox backend"
+            );
+        }
         backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
             request.permission_profile,
             request.workspace_roots,
@@ -79,7 +88,7 @@ pub async fn spawn_windows_sandbox_session_for_level(
         if request.network_proxy_restricting_sid.is_some() {
             bail!("network proxy restricting SID requires the elevated Windows sandbox backend");
         }
-        spawn_windows_sandbox_session_legacy(
+        backends::legacy::spawn_windows_sandbox_session_legacy(
             request.permission_profile,
             request.workspace_roots,
             request.codex_home,
@@ -92,6 +101,7 @@ pub async fn spawn_windows_sandbox_session_for_level(
             request.tty,
             request.stdin_open,
             request.use_private_desktop,
+            request.preserve_descendants_on_root_exit,
         )
         .await
     }
@@ -125,6 +135,7 @@ pub async fn spawn_windows_sandbox_session_legacy(
         tty,
         stdin_open,
         use_private_desktop,
+        /*preserve_descendants_on_root_exit*/ true,
     )
     .await
 }

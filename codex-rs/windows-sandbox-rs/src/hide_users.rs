@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Registry::RegCloseKey;
 use windows_sys::Win32::System::Registry::RegCreateKeyExW;
 use windows_sys::Win32::System::Registry::RegSetValueExW;
 
-const USERLIST_KEY_PATH: &str =
+pub(crate) const USERLIST_KEY_PATH: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
 
 pub fn hide_newly_created_users(usernames: &[String], log_base: &Path) {

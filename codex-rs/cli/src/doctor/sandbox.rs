@@ -150,10 +150,18 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
                     .details
                     .push("sandbox provisioning: complete".to_string());
 
-                for username in [
-                    codex_windows_sandbox::OFFLINE_USERNAME,
-                    codex_windows_sandbox::ONLINE_USERNAME,
-                ] {
+                // Account names are installation-scoped; read the exact names
+                // committed by setup instead of assuming Codex-global ones.
+                let account_names = codex_windows_sandbox::sandbox_setup_account_names(home);
+                let usernames: Vec<String> = match account_names {
+                    Some((offline, online)) => vec![offline, online],
+                    None => vec![
+                        codex_windows_sandbox::OFFLINE_USERNAME.to_string(),
+                        codex_windows_sandbox::ONLINE_USERNAME.to_string(),
+                    ],
+                };
+
+                for username in usernames {
                     let username_wide = username.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
                     let mut buffer = std::ptr::null_mut();
                     let status = unsafe {

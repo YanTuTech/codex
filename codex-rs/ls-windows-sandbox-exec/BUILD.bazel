@@ -1,0 +1,9 @@
+load("//:defs.bzl", "codex_rust_crate")
+
+codex_rust_crate(
+    # The Cargo package also ships a binary named `ls-windows-sandbox-exec`;
+    # keep the Bazel library label distinct from that generated binary target.
+    name = "ls-windows-sandbox-exec-lib",
+    crate_name = "ls_windows_sandbox_exec",
+    test_tags = ["no-sandbox"],
+)

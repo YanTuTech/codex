@@ -165,6 +165,10 @@ pub fn require_logon_sandbox_creds(
         .unwrap_or_else(|| gather_write_roots_for_permissions(permissions, command_cwd, env_map));
     let network_identity = SandboxNetworkIdentity::from_permissions(permissions, proxy_enforced);
     let marker = load_marker(codex_home)?;
+    let expected_install_id = crate::installation::read_installation_identity(&sandbox_dir)
+        .ok()
+        .flatten()
+        .map(|identity| identity.install_id_hex());
     let desired_offline_proxy_settings = desired_offline_proxy_settings(
         marker.as_ref(),
         proxy_settings_mode,
@@ -178,9 +182,11 @@ pub fn require_logon_sandbox_creds(
 
     let mut identity = match marker {
         Some(marker) if marker.version_matches() => {
-            if let Some(reason) =
-                marker.request_mismatch_reason(network_identity, &desired_offline_proxy_settings)
-            {
+            if let Some(reason) = marker.request_mismatch_reason(
+                network_identity,
+                &desired_offline_proxy_settings,
+                expected_install_id.as_deref(),
+            ) {
                 setup_reason = Some(reason);
                 None
             } else {
@@ -336,12 +342,18 @@ mod tests {
         assert!(!users_path.exists());
     }
 
+    fn sample_install_id() -> String {
+        crate::installation::SandboxInstallationIdentity::generate().install_id_hex()
+    }
+
     #[test]
     fn preserving_proxy_settings_uses_the_existing_marker() {
+        let install_id = sample_install_id();
         let marker = SetupMarker {
             version: crate::setup::SETUP_VERSION,
             offline_username: "offline".to_string(),
             online_username: "online".to_string(),
+            install_id: Some(install_id.clone()),
             created_at: None,
             proxy_ports: vec![7890],
             allow_local_binding: true,
@@ -370,6 +382,9 @@ mod tests {
             .proxy_ports,
             vec![8080]
         );
+        // Marker parsing itself remains installation-agnostic; the identity
+        // gate is exercised through request_mismatch_reason.
+        assert_eq!(marker.install_id.as_deref(), Some(install_id.as_str()));
     }
 
     #[test]
@@ -378,6 +393,7 @@ mod tests {
             version: crate::setup::SETUP_VERSION,
             offline_username: "offline".to_string(),
             online_username: "online".to_string(),
+            install_id: Some(sample_install_id()),
             created_at: None,
             proxy_ports: vec![3128, 8081],
             allow_local_binding: true,
@@ -399,7 +415,11 @@ mod tests {
         );
         assert_eq!(desired, marker.offline_proxy_settings());
         assert_eq!(
-            marker.request_mismatch_reason(SandboxNetworkIdentity::Offline, &desired),
+            marker.request_mismatch_reason(
+                SandboxNetworkIdentity::Offline,
+                &desired,
+                marker.install_id.as_deref(),
+            ),
             None
         );
     }

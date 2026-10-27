@@ -683,6 +683,77 @@ unsafe fn add_deny_ace(path: &Path, psid: *mut c_void, kind: DenyAceKind) -> Res
     result
 }
 
+/// Applies the existing deny-write policy to an already validated object handle.
+///
+/// # Safety
+/// `handle` must stay open with READ_CONTROL | WRITE_DAC, and `psid` must be valid.
+pub unsafe fn add_deny_write_ace_to_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    psid: *mut c_void,
+) -> Result<bool> {
+    let mut descriptor = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let code = GetSecurityInfo(
+        handle,
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !descriptor.is_null() {
+            LocalFree(descriptor as HLOCAL);
+        }
+        return Err(std::io::Error::from_raw_os_error(code as i32).into());
+    }
+    let result = if DenyAceKind::Write.already_present(dacl, psid) {
+        Ok(false)
+    } else {
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: DenyAceKind::Write.mask(),
+            grfAccessMode: DENY_ACCESS,
+            grfInheritance: CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: psid.cast(),
+            },
+        };
+        let mut updated = std::ptr::null_mut();
+        let code = SetEntriesInAclW(1, &entry, dacl, &mut updated);
+        let code = if code == ERROR_SUCCESS {
+            SetSecurityInfo(
+                handle,
+                1,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                updated,
+                std::ptr::null_mut(),
+            )
+        } else {
+            code
+        };
+        if !updated.is_null() {
+            LocalFree(updated as HLOCAL);
+        }
+        if code == ERROR_SUCCESS {
+            Ok(true)
+        } else {
+            Err(std::io::Error::from_raw_os_error(code as i32).into())
+        }
+    };
+    if !descriptor.is_null() {
+        LocalFree(descriptor as HLOCAL);
+    }
+    result
+}
+
 /// Adds a deny ACE to prevent reads for the given SID on the target path.
 ///
 /// `SetEntriesInAclW` places newly-created deny ACEs before allow ACEs, which

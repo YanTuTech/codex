@@ -250,6 +250,7 @@ fn restricted_token_rejects_managed_network_before_spawn() {
             tty: false,
             stdin_open: false,
             use_private_desktop: false,
+            preserve_descendants_on_root_exit: true,
         })
         .await
         .expect_err("managed networking must fail before spawning an unelevated sandbox");

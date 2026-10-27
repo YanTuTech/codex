@@ -31,6 +31,9 @@ max-threads = 1
 [test-groups.windows_process_heavy]
 max-threads = 2
 
+[test-groups.ls_windows_sandbox_exec]
+max-threads = 1
+
 [[profile.default.overrides]]
 # Do not add new tests here
 filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
@@ -67,6 +70,13 @@ test-group = 'core_apply_patch_cli_integration'
 # Serialize them to avoid exhausting Windows session/global desktop resources in CI.
 filter = 'package(codex-windows-sandbox) & test(legacy_)'
 test-group = 'windows_sandbox_legacy_sessions'
+
+[[profile.default.overrides]]
+# The LeapSea runner matrix mutates capability-SID ACLs and launches real
+# restricted-token process trees. Serialize it to avoid cross-test ACL races.
+platform = 'cfg(windows)'
+filter = 'package(ls-windows-sandbox-exec)'
+test-group = 'ls_windows_sandbox_exec'
 
 [[profile.default.overrides]]
 # This Codex-home startup path still exceeded the broader Windows-heavy ceiling

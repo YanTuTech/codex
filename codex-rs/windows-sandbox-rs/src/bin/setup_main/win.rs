@@ -1,4 +1,5 @@
 mod firewall;
+mod ls_owned_acl;
 mod no_reparse_dir;
 mod read_acl_mutex;
 
@@ -11,7 +12,7 @@ use codex_windows_sandbox::SETUP_VERSION;
 use codex_windows_sandbox::SetupErrorCode;
 use codex_windows_sandbox::SetupErrorReport;
 use codex_windows_sandbox::SetupFailure;
-use codex_windows_sandbox::add_deny_write_ace;
+
 use codex_windows_sandbox::convert_string_sid_to_sid;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
@@ -72,6 +73,12 @@ const WRITE_ROOT_ALLOW_MASK: u32 =
 
 mod sandbox_users;
 mod setup_runtime_bin;
+mod uninstall_acl;
+#[cfg(test)]
+mod uninstall_acl_tests;
+mod uninstall_state_machine;
+#[cfg(test)]
+mod uninstall_state_machine_tests;
 use no_reparse_dir::open_or_create_no_reparse;
 use read_acl_mutex::acquire_read_acl_mutex;
 use read_acl_mutex::read_acl_mutex_exists;
@@ -85,8 +92,12 @@ use sandbox_users::sid_bytes_to_psid;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Payload {
     version: u32,
+    #[serde(default)]
+    install_id: Option<String>,
     offline_username: String,
     online_username: String,
+    #[serde(default)]
+    sandbox_group: Option<String>,
     codex_home: PathBuf,
     command_cwd: PathBuf,
     read_roots: Vec<PathBuf>,
@@ -114,6 +125,57 @@ enum SetupMode {
     Full,
     ProvisionOnly,
     ReadAclsOnly,
+    /// Removes exactly the resources owned by the payload's installation
+    /// identity; never touches other installations' resources and never
+    /// restores a wholesale ACL snapshot.
+    Uninstall,
+}
+
+/// Parses and verifies the payload's installation identity. The account and
+/// group names in the payload must exactly match the names derived from the
+/// install ID; any mismatch is a hostile or corrupt payload and fails closed.
+fn verified_installation_identity(
+    payload: &Payload,
+) -> Result<codex_windows_sandbox::installation::SandboxInstallationIdentity> {
+    let install_id = payload.install_id.as_deref().ok_or_else(|| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperRequestArgsFailed,
+            "setup payload is missing the installation identity",
+        ))
+    })?;
+    let identity =
+        codex_windows_sandbox::installation::SandboxInstallationIdentity::from_install_id_hex(
+            install_id,
+        )
+        .map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperRequestArgsFailed,
+                format!("invalid installation identity: {err}"),
+            ))
+        })?;
+    identity.validate_derived_account_names().map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperRequestArgsFailed,
+            format!("derived installation account names are invalid: {err}"),
+        ))
+    })?;
+    if payload.offline_username != identity.offline_username()
+        || payload.online_username != identity.online_username()
+    {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperRequestArgsFailed,
+            "payload account names do not match the installation identity",
+        )));
+    }
+    if let Some(group) = payload.sandbox_group.as_deref()
+        && group != identity.sandbox_group_name()
+    {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperRequestArgsFailed,
+            "payload sandbox group does not match the installation identity",
+        )));
+    }
+    Ok(identity)
 }
 
 fn log_line(log: &mut dyn Write, msg: &str) -> Result<()> {
@@ -307,6 +369,11 @@ fn lock_sandbox_dir(
     // bound to a no-reparse handle without changing full setup behavior.
     let directory = match setup_mode {
         SetupMode::Full | SetupMode::ReadAclsOnly => {
+            std::fs::create_dir_all(dir)?;
+            None
+        }
+        SetupMode::Uninstall => {
+            // Uninstall never widens or rewrites ACLs; it only removes state.
             std::fs::create_dir_all(dir)?;
             None
         }
@@ -507,28 +574,36 @@ fn real_main() -> Result<()> {
 }
 
 fn run_setup(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
-    let writes_setup_marker = !payload.refresh_only && payload.mode != SetupMode::ReadAclsOnly;
+    let identity = verified_installation_identity(payload)?;
+    let writes_setup_marker = !payload.refresh_only
+        && !matches!(payload.mode, SetupMode::ReadAclsOnly | SetupMode::Uninstall);
     if writes_setup_marker {
         prepare_setup_marker(&payload.codex_home, &payload.real_user)?;
     }
     match payload.mode {
-        SetupMode::ReadAclsOnly => run_read_acl_only(payload, log),
-        SetupMode::ProvisionOnly => run_provision_only(payload, log, sbx_dir),
-        SetupMode::Full => run_setup_full(payload, log, sbx_dir),
+        SetupMode::ReadAclsOnly => run_read_acl_only(payload, &identity, log),
+        SetupMode::ProvisionOnly => run_provision_only(payload, &identity, log, sbx_dir),
+        SetupMode::Full => run_setup_full(payload, &identity, log, sbx_dir),
+        SetupMode::Uninstall => run_uninstall_only(payload, &identity, log),
     }?;
-    if writes_setup_marker {
+    if writes_setup_marker && !matches!(payload.mode, SetupMode::ProvisionOnly) {
         commit_setup_marker(
             &payload.codex_home,
-            &payload.offline_username,
-            &payload.online_username,
+            &identity,
             &payload.proxy_ports,
             payload.allow_local_binding,
+            &payload.read_roots,
+            &payload.write_roots,
         )?;
     }
     Ok(())
 }
 
-fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
+fn run_read_acl_only(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    log: &mut dyn Write,
+) -> Result<()> {
     let _read_acl_guard = match acquire_read_acl_mutex()? {
         Some(guard) => guard,
         None => {
@@ -537,7 +612,7 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
         }
     };
     log_line(log, "read-acl-only mode: applying read ACLs")?;
-    let sandbox_group_sid = resolve_sandbox_users_group_sid()?;
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&identity.sandbox_group_name())?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid)?;
     let mut refresh_errors: Vec<String> = Vec::new();
     if !payload.read_roots.is_empty() {
@@ -593,15 +668,11 @@ fn run_read_acl_only(payload: &Payload, log: &mut dyn Write) -> Result<()> {
 
 fn provision_and_hide_sandbox_users(
     payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
     log: &mut dyn Write,
     sbx_dir: &Path,
 ) -> Result<()> {
-    let provision_result = provision_sandbox_users(
-        &payload.codex_home,
-        &payload.offline_username,
-        &payload.online_username,
-        log,
-    );
+    let provision_result = provision_sandbox_users(&payload.codex_home, identity, log);
     if let Err(err) = provision_result {
         if extract_setup_failure(&err).is_some() {
             return Err(err);
@@ -611,20 +682,19 @@ fn provision_and_hide_sandbox_users(
             format!("provision sandbox users failed: {err}"),
         )));
     }
-    let users = vec![
-        payload.offline_username.clone(),
-        payload.online_username.clone(),
-    ];
+    let users = vec![identity.offline_username(), identity.online_username()];
     hide_newly_created_users(&users, sbx_dir);
     Ok(())
 }
 
 fn configure_offline_sandbox_network(
     payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
     offline_sid_str: &str,
     log: &mut dyn Write,
 ) -> Result<()> {
     let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
+        identity,
         offline_sid_str,
         &payload.proxy_ports,
         payload.allow_local_binding,
@@ -639,7 +709,7 @@ fn configure_offline_sandbox_network(
             format!("ensure offline proxy allowlist failed: {err}"),
         )));
     }
-    let firewall_result = firewall::ensure_offline_outbound_block(offline_sid_str, log);
+    let firewall_result = firewall::ensure_offline_outbound_block(identity, offline_sid_str, log);
     if let Err(err) = firewall_result {
         if extract_setup_failure(&err).is_some() {
             return Err(err);
@@ -651,13 +721,274 @@ fn configure_offline_sandbox_network(
     }
     install_wfp_filters(
         &payload.codex_home,
-        &payload.offline_username,
+        identity,
+        &identity.offline_username(),
+        &payload.real_user,
         payload.otel.as_ref(),
         |message| {
             let _ = log_line(log, message);
         },
     );
+    // Telemetry remains best effort; the containment boundary does not.
+    codex_windows_sandbox::read_live_filter_facts(&payload.codex_home, identity, offline_sid_str)?;
     Ok(())
+}
+
+/// Reads the read/write roots persisted by the last committed setup marker
+/// for precise ACE cleanup. A missing or unreadable marker yields an empty
+/// list; uninstall then proceeds without root cleanup.
+fn recorded_setup_roots(codex_home: &Path) -> Vec<PathBuf> {
+    let marker_path = sandbox_dir(codex_home).join("setup_marker.json");
+    let Ok(contents) = std::fs::read_to_string(&marker_path) else {
+        return Vec::new();
+    };
+    #[derive(serde::Deserialize)]
+    struct RecordedMarker {
+        #[serde(default)]
+        read_roots: Vec<PathBuf>,
+        #[serde(default)]
+        write_roots: Vec<PathBuf>,
+    }
+    let Ok(marker) = serde_json::from_str::<RecordedMarker>(&contents) else {
+        return Vec::new();
+    };
+    let mut roots = marker.read_roots;
+    roots.extend(marker.write_roots);
+    roots
+}
+
+/// Removes exactly the resources owned by `identity`. Every step is
+/// logged; ACL failure stops before destroying the group needed for retry,
+/// and no resource owned by a different installation
+/// (Codex-global or otherwise) is ever touched.
+/// Production wiring of the uninstall state machine: real Win32/COM/WFP
+/// effects over the payload's codex home, with a file-backed atomic journal.
+/// ACL failures preserve the group and stop before later phases so retry can resolve its SID.
+fn run_uninstall_only(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    log: &mut dyn Write,
+) -> Result<()> {
+    log_line(
+        log,
+        &format!(
+            "uninstall mode: removing resources owned by installation {}",
+            identity.install_suffix()
+        ),
+    )?;
+    let codex_home = payload.codex_home.as_path();
+
+    let mut effects = WinUninstallEffects {
+        codex_home: codex_home.to_path_buf(),
+    };
+    let mut journal_io = FileCleanupJournalIo {
+        sandbox_dir: sandbox_dir(codex_home),
+    };
+    let mut log_line_sink = String::new();
+    let outcome = uninstall_state_machine::run_uninstall(
+        identity,
+        &mut effects,
+        &mut journal_io,
+        || chrono::Utc::now().to_rfc3339(),
+        &mut |message| {
+            log_line_sink.push_str(message);
+            log_line_sink.push('\n');
+        },
+    );
+    if !log_line_sink.is_empty() {
+        log.write_all(log_line_sink.as_bytes())?;
+    }
+    match outcome {
+        Ok(()) => {
+            log_line(log, "uninstall fully complete; state deleted")?;
+            Ok(())
+        }
+        Err(failures) => {
+            for failure in &failures {
+                log_line(
+                    log,
+                    &format!(
+                        "uninstall incomplete at {}: {}",
+                        failure.phase, failure.detail
+                    ),
+                )?;
+            }
+            Err(anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperUnknownError,
+                format!(
+                    "uninstall left {} recoverable failure(s); rerun the uninstall for the same installation",
+                    failures.len()
+                ),
+            )))
+        }
+    }
+}
+
+/// Real-effect adapter: every call targets the exact installation identity
+/// recorded in the payload.
+struct WinUninstallEffects {
+    codex_home: PathBuf,
+}
+
+impl uninstall_state_machine::UninstallEffects for WinUninstallEffects {
+    fn recorded_roots(&self) -> Vec<PathBuf> {
+        let mut roots = recorded_setup_roots(&self.codex_home);
+        roots.push(sandbox_dir(&self.codex_home));
+        roots.push(sandbox_secrets_dir(&self.codex_home));
+        roots.push(sandbox_bin_dir(&self.codex_home));
+        roots
+    }
+
+    fn group_sid(&self) -> Option<Vec<u8>> {
+        // Fail-closed derivation: the group SID comes from the persisted
+        // installation identity, not from an ambient name.
+        let identity = codex_windows_sandbox::installation::read_installation_identity(
+            &sandbox_dir(&self.codex_home),
+        )
+        .ok()
+        .flatten()?;
+        sandbox_users::resolve_sandbox_users_group_sid(&identity.sandbox_group_name()).ok()
+    }
+
+    fn remove_group_aces(&mut self, roots: &[PathBuf], sid: &[u8]) -> Vec<String> {
+        let mut failures = Vec::new();
+        for root in roots {
+            match uninstall_acl::remove_group_allow_aces(root, sid) {
+                Ok(_) => {}
+                Err(err) => failures.push(format!("{}: {err}", root.display())),
+            }
+        }
+        failures
+    }
+
+    fn remove_firewall_rules(
+        &mut self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) {
+        // Logged best effort; the presence query decides the phase outcome.
+        let mut sink = Vec::new();
+        let _ = firewall::remove_offline_rules_for_identity(identity, &mut sink);
+    }
+
+    fn firewall_rules_present(
+        &self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) -> Vec<String> {
+        firewall::firewall_rules_present(identity)
+    }
+
+    fn remove_wfp_objects(
+        &mut self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) {
+        let mut sink = Vec::new();
+        let _ = codex_windows_sandbox::remove_wfp_objects_for_installation(
+            &self.codex_home,
+            identity,
+            &mut |message| {
+                let _ = sink.write_all(message.as_bytes());
+            },
+        );
+    }
+
+    fn wfp_objects_present(
+        &self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) -> Vec<String> {
+        codex_windows_sandbox::wfp_objects_present(&self.codex_home, identity)
+    }
+
+    fn remove_accounts(
+        &mut self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) {
+        // Best effort; the presence query decides the phase outcome.
+        let mut sink = Vec::new();
+        let _ = sandbox_users::remove_sandbox_users(identity, &mut sink);
+    }
+
+    fn accounts_present(
+        &self,
+        identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    ) -> Vec<String> {
+        sandbox_users::accounts_present(identity)
+    }
+
+    fn delete_state_file(&mut self, name: &str) {
+        if name == "sandbox_users.json" {
+            // The secrets-dir copy belongs to this installation as well.
+            let secrets_copy = sandbox_secrets_dir(&self.codex_home).join(name);
+            let _ = std::fs::remove_file(secrets_copy);
+        }
+        let _ = std::fs::remove_file(sandbox_dir(&self.codex_home).join(name));
+    }
+
+    fn persisted_installation_id(&self) -> Option<String> {
+        codex_windows_sandbox::installation::read_installation_identity(&sandbox_dir(
+            &self.codex_home,
+        ))
+        .ok()
+        .flatten()
+        .map(|identity| identity.install_id_hex())
+    }
+
+    fn ownership_digest(&self) -> Option<String> {
+        let path = self.codex_home.join(".sandbox").join("wfp_ownership.json");
+        let contents = std::fs::read(path).ok()?;
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&contents);
+        Some(format!("{digest:x}"))
+    }
+}
+
+/// File-backed journal IO with atomic temp+rename writes inside the
+/// protected sandbox state directory.
+struct FileCleanupJournalIo {
+    sandbox_dir: PathBuf,
+}
+
+impl uninstall_state_machine::UninstallJournalIo for FileCleanupJournalIo {
+    fn read_journal(&self) -> Option<uninstall_state_machine::CleanupJournal> {
+        let path = self
+            .sandbox_dir
+            .join(uninstall_state_machine::CLEANUP_JOURNAL_FILE_NAME);
+        let contents = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
+    fn write_journal(
+        &mut self,
+        journal: &uninstall_state_machine::CleanupJournal,
+    ) -> std::io::Result<()> {
+        let sandbox_dir = self.sandbox_dir.clone();
+        let rename_root = self.sandbox_dir.clone();
+        uninstall_state_machine::write_journal_atomic(
+            journal,
+            move |temp_name| {
+                let temp_path = sandbox_dir.join(temp_name);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp_path)?;
+                Ok((temp_path, file))
+            },
+            move |temp_path, final_name| std::fs::rename(temp_path, rename_root.join(final_name)),
+        )
+    }
+
+    fn delete_journal(&mut self) -> std::io::Result<()> {
+        std::fs::remove_file(
+            self.sandbox_dir
+                .join(uninstall_state_machine::CLEANUP_JOURNAL_FILE_NAME),
+        )
+        .or_else(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        })
+    }
 }
 
 fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<()> {
@@ -667,7 +998,10 @@ fn lock_persistent_sandbox_dirs(payload: &Payload, sandbox_group_sid: &[u8]) -> 
         sandbox_group_sid,
         GRANT_ACCESS,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
-        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+        // The caller owns untrusted request/attempt files and must atomically
+        // rename and remove them. This adds no FILE_DELETE_CHILD authority;
+        // the administrator-owned receipt subtree has its own protected ACL.
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         payload.mode,
     )
     .map_err(|err| {
@@ -725,56 +1059,337 @@ fn lock_sandbox_bin_dir(payload: &Payload, sandbox_group_sid: &[u8]) -> Result<(
     })
 }
 
-fn run_provision_only(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
-    provision_and_hide_sandbox_users(payload, log, sbx_dir)?;
-    let offline_sid = resolve_sid(&payload.offline_username).map_err(|err| {
+fn run_provision_only(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    log: &mut dyn Write,
+    sbx_dir: &Path,
+) -> Result<()> {
+    // R2B: provisioning is a nonce-challenged operation. Without a valid
+    // one-time request from Main the helper refuses to touch the machine.
+    let now = chrono::Utc::now().to_rfc3339();
+    let request = codex_windows_sandbox::setup_receipt::read_setup_request(
+        &payload.codex_home,
+        identity,
+        &now,
+    )
+    .map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperRequestArgsFailed,
+            format!("elevated setup requires a valid one-time request: {err}"),
+        ))
+    })?;
+    log_line(
+        log,
+        &format!(
+            "setup request accepted (nonce {}…, expires {})",
+            &request.nonce[..8],
+            request.expires_at
+        ),
+    )?;
+
+    provision_and_hide_sandbox_users(payload, identity, log, sbx_dir)?;
+    let offline_username = identity.offline_username();
+    let offline_sid = resolve_sid(&offline_username).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
-            format!(
-                "resolve SID for offline user {} failed: {err}",
-                payload.offline_username
-            ),
+            format!("resolve SID for offline user {offline_username} failed: {err}"),
         ))
     })?;
     let offline_sid_str = string_from_sid_bytes(&offline_sid).map_err(anyhow::Error::msg)?;
 
-    let sandbox_group_sid = resolve_sandbox_users_group_sid().map_err(|err| {
-        anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperSidResolveFailed,
-            format!("resolve sandbox users group SID failed: {err}"),
-        ))
-    })?;
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&identity.sandbox_group_name())
+        .map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperSidResolveFailed,
+                format!("resolve sandbox users group SID failed: {err}"),
+            ))
+        })?;
+    let sandbox_group_sid_str =
+        string_from_sid_bytes(&sandbox_group_sid).map_err(anyhow::Error::msg)?;
+    let online_sid = resolve_sid(&identity.online_username())?;
+    let online_sid_str = string_from_sid_bytes(&online_sid).map_err(anyhow::Error::msg)?;
 
-    configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+    configure_offline_sandbox_network(payload, identity, &offline_sid_str, log)?;
 
     lock_sandbox_bin_dir(payload, &sandbox_group_sid)?;
     lock_persistent_sandbox_dirs(payload, &sandbox_group_sid)?;
+
+    // R2B: mint the nonce-bound machine-effect receipt. Main never writes
+    // this file; it only verifies it against the request and the marker.
+    finalize_provisioned_setup(payload, identity, || {
+        write_provisioning_receipt(
+            payload,
+            identity,
+            &request,
+            &offline_sid_str,
+            &online_sid_str,
+            &sandbox_group_sid_str,
+            log,
+        )
+    })?;
+
     log_note("setup provisioning binary completed", Some(sbx_dir));
     Ok(())
 }
 
-fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Result<()> {
+// The receipt must bind final marker bytes, never the empty protected
+// placeholder created before provisioning. The outer setup path does not
+// rewrite this marker after the nonce-bound receipt has been minted.
+fn finalize_provisioned_setup(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    write_receipt: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    commit_setup_marker(
+        &payload.codex_home,
+        identity,
+        &payload.proxy_ports,
+        payload.allow_local_binding,
+        &payload.read_roots,
+        &payload.write_roots,
+    )?;
+    write_receipt()
+}
+
+// The frozen offline backend installs three BLOCK rules. The old proxy
+// ALLOW rule is deliberately removed by ensure_offline_proxy_allowlist.
+fn verified_provisioning_firewall_rules(
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    present: &[String],
+) -> Result<Vec<String>> {
+    let mut expected = vec![
+        identity.offline_block_rule_name(),
+        identity.offline_block_loopback_tcp_rule_name(),
+        identity.offline_block_loopback_udp_rule_name(),
+    ];
+    expected.sort();
+    let mut actual = present.to_vec();
+    actual.sort();
+    if actual != expected {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUnknownError,
+            "offline firewall closure must contain exactly three BLOCK rules and no legacy ALLOW rule",
+        )));
+    }
+    Ok(expected)
+}
+
+/// Collects the exact provisioned facts and writes the nonce-bound receipt
+/// into the elevated directory, consuming the one-time request.
+fn write_provisioning_receipt(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    request: &codex_windows_sandbox::setup_receipt::SetupRequestFile,
+    offline_sid: &str,
+    online_sid: &str,
+    group_sid: &str,
+    log: &mut dyn Write,
+) -> Result<()> {
+    use codex_windows_sandbox::setup_receipt::ElevatedSetupReceiptV1;
+
+    let marker_digest = codex_windows_sandbox::setup_receipt::sha256_file_hex(
+        &sandbox_dir(&payload.codex_home).join("setup_marker.json"),
+    );
+    let helper_digest = codex_windows_sandbox::setup_receipt::compute_self_digest();
+
+    // The WFP ownership record is REQUIRED: a receipt over an empty or
+    // partial machine-effect closure must never be written (v2 contract).
+    let ownership_path = sandbox_dir(&payload.codex_home).join("wfp_ownership.json");
+    let ownership_contents = std::fs::read_to_string(&ownership_path).map_err(|err| {
+        anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUnknownError,
+            format!("wfp ownership record unreadable: {err}"),
+        ))
+    })?;
+    let ownership_record: codex_windows_sandbox::WfpOwnershipRecord =
+        serde_json::from_str(&ownership_contents).map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperUnknownError,
+                format!("wfp ownership record malformed: {err}"),
+            ))
+        })?;
+    let ownership_digest =
+        codex_windows_sandbox::setup_receipt::sha256_hex(ownership_contents.as_bytes());
+
+    let (marker_digest, helper_digest) = match (marker_digest, helper_digest) {
+        (Ok(marker), Ok(helper)) => (marker, helper),
+        _ => {
+            return Err(anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperUnknownError,
+                "provisioning receipt inputs unreadable (marker or self digest)",
+            )));
+        }
+    };
+
+    let firewall_rule_names = verified_provisioning_firewall_rules(
+        identity,
+        &firewall::firewall_rules_present(identity),
+    )?;
+
+    // WFP keys come from the REQUIRED ownership record; the filter-key map
+    // must cover exactly the static spec set - no missing or extra names.
+    let wfp_filters = ownership_record.filter_keys;
+    let wfp_provider = ownership_record.provider_key;
+    let wfp_sublayer = ownership_record.sublayer_key;
+    let spec_names = codex_windows_sandbox::filter_spec_names();
+    if wfp_provider.is_empty() || wfp_sublayer.is_empty() {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUnknownError,
+            "wfp ownership record carries empty provider or sublayer keys",
+        )));
+    }
+    if wfp_filters.len() != spec_names.len()
+        || !spec_names
+            .iter()
+            .all(|name| wfp_filters.contains_key(*name))
+    {
+        return Err(anyhow::Error::new(SetupFailure::new(
+            SetupErrorCode::HelperUnknownError,
+            "wfp ownership record filter-key closure is incomplete",
+        )));
+    }
+
+    // Live per-filter read-back (layer, action, user-condition SID) fresh
+    // from the engine: the receipt binds verified facts, never intents.
+    let wfp_filter_facts =
+        codex_windows_sandbox::read_live_filter_facts(&payload.codex_home, identity, offline_sid)
+            .map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperUnknownError,
+                format!("live wfp filter read-back failed: {err}"),
+            ))
+        })?;
+
+    let os_build = os_build_string();
+    let receipt = ElevatedSetupReceiptV1 {
+        version: codex_windows_sandbox::setup_receipt::RECEIPT_VERSION,
+        nonce: request.nonce.clone(),
+        install_id: identity.install_id_hex(),
+        evidence_digest: request.evidence_digest.clone(),
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        setup_version: SETUP_VERSION,
+        os_build,
+        helper_sha256: helper_digest,
+        marker_sha256: marker_digest,
+        ownership_sha256: ownership_digest,
+        offline_account_sid: offline_sid.to_string(),
+        online_account_sid: online_sid.to_string(),
+        sandbox_group_sid: group_sid.to_string(),
+        firewall_rule_names,
+        wfp_provider_key: wfp_provider,
+        wfp_sublayer_key: wfp_sublayer,
+        wfp_filter_keys: wfp_filters,
+        wfp_filter_facts,
+    };
+    // The receipt directory protection binds the resolved real-user SID
+    // (never the ambiguous account name) as its read-only trustee.
+    let real_user_sid = resolve_sid(&payload.real_user)
+        .map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperSidResolveFailed,
+                format!(
+                    "resolve SID for real user {} failed: {err}",
+                    payload.real_user
+                ),
+            ))
+        })
+        .and_then(|sid| string_from_sid_bytes(&sid).map_err(anyhow::Error::msg))?;
+    let path = codex_windows_sandbox::setup_receipt::write_receipt_and_consume_request(
+        &payload.codex_home,
+        &receipt,
+        &real_user_sid,
+    )?;
+    log_line(
+        log,
+        &format!("provisioning receipt written: {}", path.display()),
+    )?;
+    Ok(())
+}
+
+/// OS build string (major.minor.build) read from the registry's
+/// CurrentVersion keys — the same authoritative source the OS itself uses,
+/// independent of app-compat version lies.
+fn os_build_string() -> String {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    use windows_sys::Win32::System::Registry::KEY_READ;
+    use windows_sys::Win32::System::Registry::RRF_RT_REG_SZ;
+    use windows_sys::Win32::System::Registry::RegCloseKey;
+    use windows_sys::Win32::System::Registry::RegGetValueW;
+    unsafe {
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let read_string = |value: &[u16]| -> Option<String> {
+            let mut buffer = [0u16; 64];
+            let mut size = (buffer.len() * 2) as u32;
+            let code = RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+            );
+            if code != ERROR_SUCCESS {
+                return None;
+            }
+            let length = (size as usize / 2).saturating_sub(1);
+            Some(String::from_utf16_lossy(&buffer[..length]))
+        };
+        let major: &[u16] = &"CurrentMajorVersionNumber"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let _ = major;
+        let major_value: Vec<u16> = "CurrentMajorVersionNumber"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let minor_value: Vec<u16> = "CurrentMinorVersionNumber"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let build_value: Vec<u16> = "CurrentBuildNumber".encode_utf16().chain(Some(0)).collect();
+        // Note: CurrentMajor/MinorVersionNumber are REG_DWORD; fall back to
+        // well-known constants when the string read fails.
+        let major = read_string(&major_value).unwrap_or_else(|| "10".to_string());
+        let minor = read_string(&minor_value).unwrap_or_else(|| "0".to_string());
+        let build = read_string(&build_value).unwrap_or_default();
+        let _ = KEY_READ;
+        let _ = RegCloseKey;
+        format!("{major}.{minor}.{build}")
+    }
+}
+
+fn run_setup_full(
+    payload: &Payload,
+    identity: &codex_windows_sandbox::installation::SandboxInstallationIdentity,
+    log: &mut dyn Write,
+    sbx_dir: &Path,
+) -> Result<()> {
     let refresh_only = payload.refresh_only;
     if !refresh_only {
-        provision_and_hide_sandbox_users(payload, log, sbx_dir)?;
+        provision_and_hide_sandbox_users(payload, identity, log, sbx_dir)?;
     }
-    let offline_sid = resolve_sid(&payload.offline_username).map_err(|err| {
+    let offline_username = identity.offline_username();
+    let offline_sid = resolve_sid(&offline_username).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
-            format!(
-                "resolve SID for offline user {} failed: {err}",
-                payload.offline_username
-            ),
+            format!("resolve SID for offline user {offline_username} failed: {err}"),
         ))
     })?;
     let offline_sid_str = string_from_sid_bytes(&offline_sid).map_err(anyhow::Error::msg)?;
 
-    let sandbox_group_sid = resolve_sandbox_users_group_sid().map_err(|err| {
-        anyhow::Error::new(SetupFailure::new(
-            SetupErrorCode::HelperSidResolveFailed,
-            format!("resolve sandbox users group SID failed: {err}"),
-        ))
-    })?;
+    let sandbox_group_sid = resolve_sandbox_users_group_sid(&identity.sandbox_group_name())
+        .map_err(|err| {
+            anyhow::Error::new(SetupFailure::new(
+                SetupErrorCode::HelperSidResolveFailed,
+                format!("resolve sandbox users group SID failed: {err}"),
+            ))
+        })?;
     let sandbox_group_psid = sid_bytes_to_psid(&sandbox_group_sid).map_err(|err| {
         anyhow::Error::new(SetupFailure::new(
             SetupErrorCode::HelperSidResolveFailed,
@@ -786,7 +1401,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
 
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
-        configure_offline_sandbox_network(payload, &offline_sid_str, log)?;
+        configure_offline_sandbox_network(payload, identity, &offline_sid_str, log)?;
     }
 
     // Deny-read ACEs must be present before the sandboxed command starts. Apply
@@ -981,7 +1596,7 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
                     .ok_or_else(|| anyhow::anyhow!("convert deny capability SID failed"))?
             };
 
-            match unsafe { add_deny_write_ace(path, deny_psid) } {
+            match unsafe { ls_owned_acl::protect(path, deny_psid, payload, identity) } {
                 Ok(true) => {
                     log_line(
                         log,
@@ -1075,10 +1690,125 @@ mod tests {
     }
 
     #[test]
+    fn control_request_file_can_be_published_and_removed_after_directory_lock() {
+        let temp = tempfile::tempdir().expect("temporary control home");
+        let mut payload: Payload = serde_json::from_value(payload_json()).expect("payload");
+        payload.codex_home = temp.path().to_path_buf();
+        payload.real_user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").expect("domain"),
+            std::env::var("USERNAME").expect("user")
+        );
+        let dir = codex_windows_sandbox::sandbox_dir(temp.path());
+        fs::create_dir_all(&dir).expect("control directory");
+        // Match an existing protected control directory: inherited parent
+        // FullControl must not mask the helper's effective caller rights.
+        unsafe {
+            use windows_sys::Win32::Security::Authorization::{
+                GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+            };
+            use windows_sys::Win32::Security::{
+                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut dacl = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            assert_eq!(
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor
+                ),
+                0
+            );
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            LocalFree(descriptor as _);
+        }
+        let system_sid = super::resolve_sid("SYSTEM").expect("system SID");
+        super::lock_persistent_sandbox_dirs(&payload, &system_sid).expect("control-directory ACL");
+        let source = dir.join("private-request.tmp");
+        let published = dir.join("setup-request-v1.json");
+        fs::write(&source, "untrusted request fixture").expect("create own request");
+        fs::rename(&source, &published).expect("atomic publication of own request");
+        fs::remove_file(&published).expect("cleanup own request");
+    }
+
+    #[test]
     fn payload_defaults_otel_absent() {
         let payload: Payload = serde_json::from_value(payload_json()).expect("payload");
 
         assert_eq!(payload.otel, None);
+    }
+
+    #[test]
+    fn provisioning_receipt_rejects_missing_duplicate_and_legacy_allow_rules() {
+        let identity = codex_windows_sandbox::installation::SandboxInstallationIdentity::generate();
+        let blocks = vec![
+            identity.offline_block_rule_name(),
+            identity.offline_block_loopback_tcp_rule_name(),
+            identity.offline_block_loopback_udp_rule_name(),
+        ];
+        assert!(super::verified_provisioning_firewall_rules(&identity, &blocks).is_ok());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &blocks[..2]).is_err());
+        let mut legacy = blocks.clone();
+        legacy.push(identity.offline_allow_loopback_proxy_rule_name());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &legacy).is_err());
+        let mut duplicate = blocks.clone();
+        duplicate.push(blocks[0].clone());
+        assert!(super::verified_provisioning_firewall_rules(&identity, &duplicate).is_err());
+    }
+
+    #[test]
+    fn provisioning_receipt_binds_final_marker_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary");
+        let codex_home = temporary.path();
+        std::fs::create_dir(codex_home.join(".sandbox")).expect("sandbox");
+        let marker = codex_home.join(".sandbox/setup_marker.json");
+        std::fs::write(&marker, b"").expect("placeholder");
+        let mut value = payload_json();
+        value["codex_home"] = serde_json::json!(codex_home);
+        value["mode"] = serde_json::json!("provision-only");
+        let payload: Payload = serde_json::from_value(value).expect("payload");
+        let identity = codex_windows_sandbox::installation::SandboxInstallationIdentity::generate();
+        let mut recorded = None;
+        super::finalize_provisioned_setup(&payload, &identity, || {
+            let contents = std::fs::read(&marker)?;
+            let value: serde_json::Value = serde_json::from_slice(&contents)?;
+            assert_eq!(
+                value["install_id"],
+                serde_json::json!(identity.install_id_hex())
+            );
+            recorded = Some(codex_windows_sandbox::setup_receipt::sha256_hex(&contents));
+            Ok(())
+        })
+        .expect("finalized");
+        assert_eq!(
+            recorded,
+            Some(
+                codex_windows_sandbox::setup_receipt::sha256_file_hex(&marker).expect("final hash")
+            )
+        );
     }
 
     #[test]

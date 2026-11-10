@@ -5,6 +5,7 @@
 
 #![cfg(target_os = "macos")]
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::process::Output;
 use std::time::Duration;
@@ -23,6 +24,48 @@ fn run_runner(args: &[&str]) -> std::io::Result<Output> {
 
 fn temp_workspace() -> std::io::Result<tempfile::TempDir> {
     tempfile::tempdir()
+}
+
+#[test]
+fn ordinary_task_sandbox_rejects_browser_exec_from_a_child_shell() {
+    let workspace = temp_workspace().unwrap();
+    let root = workspace.path();
+    for (path, allowed) in [
+        ("Google Chrome.app/Contents/MacOS/Google Chrome", false),
+        (
+            "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            false,
+        ),
+        ("chrome-headless-shell", false),
+        ("ordinary-command", true),
+    ] {
+        let executable = root.join(path);
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::write(&executable, "#!/bin/sh\nprintf executed\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = run_runner(&[
+            "--workspace-root",
+            root.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec \"$1\"",
+            "sh",
+            executable.to_str().unwrap(),
+        ])
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), allowed, "{path}: {stderr}");
+        if allowed {
+            assert_eq!(output.stdout, b"executed");
+        } else {
+            assert!(output.stdout.is_empty(), "{path} executed");
+            assert!(
+                stderr.contains("Operation not permitted"),
+                "{path}: {stderr}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -624,7 +667,7 @@ fn danger_full_access_policy_runs_unrestricted() {
         "/bin/sh",
         "-c",
         &format!(
-            "touch '{}' && curl -sS --max-time 10 -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/",
+            "touch '{}' && curl -sSI --max-time 10 -o /dev/null -w '%{{http_code}}' https://pypi.org/simple/",
             outside.display()
         ),
     ])

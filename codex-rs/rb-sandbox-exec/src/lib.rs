@@ -2,8 +2,8 @@
 //! inside a macOS Seatbelt sandbox on behalf of ResearchBuddy's managed
 //! runtime.
 //!
-//! The SBPL profile is always compiled by the shared `codex-sandboxing`
-//! Seatbelt implementation; this crate never hand-writes policy text. Runner
+//! The SBPL profile is compiled by the shared `codex-sandboxing` Seatbelt
+//! implementation and extended with task-specific execution restrictions. Runner
 //! level failures (unusable workspace root, profile compilation errors, a
 //! missing `sandbox-exec`, or spawn errors) are reported as a single
 //! `RB_SANDBOX_UNAVAILABLE:<reason>` line on stderr with exit code
@@ -160,9 +160,7 @@ pub fn build_file_system_policy(
 #[cfg(target_os = "macos")]
 /// Compiles the sandbox plan for `command` under `options`.
 ///
-/// Uses the shared `create_seatbelt_command_args` API verbatim: its returned
-/// argument vector (profile via `-p`, parameters via `-D KEY=VALUE`, then
-/// `--` and the command argv) is passed to `/usr/bin/sandbox-exec` unchanged.
+/// Extends the shared Seatbelt profile before launching the command.
 pub fn build_sandbox_exec_plan(
     options: &SandboxExecOptions,
     command: &[String],
@@ -184,7 +182,7 @@ pub fn build_sandbox_exec_plan(
             options.network_mode.network_sandbox_policy(),
         ),
     };
-    let seatbelt_args = codex_sandboxing::seatbelt::create_seatbelt_command_args(
+    let mut seatbelt_args = codex_sandboxing::seatbelt::create_seatbelt_command_args(
         codex_sandboxing::seatbelt::CreateSeatbeltCommandArgsParams {
             command: command.to_vec(),
             file_system_sandbox_policy: &file_system_sandbox_policy,
@@ -197,6 +195,20 @@ pub fn build_sandbox_exec_plan(
             extra_allow_unix_sockets: &[],
         },
     )?;
+    if matches!(
+        options.sandbox_policy,
+        None | Some(SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. })
+    ) {
+        // The shared compiler emits `-p, profile` first. Reject exec before a
+        // browser can crash, even when a task script launches it indirectly.
+        // The host's approved Chromium profile can opt headless shell back in.
+        seatbelt_args[1].push_str(
+            r##"
+(deny process-exec (regex #"(^|/)Google Chrome( for Testing)?[.]app/Contents/MacOS/Google Chrome( for Testing)?$"))
+(deny process-exec (regex #"(^|/)chrome-headless-shell$"))
+"##,
+        );
+    }
     Ok(SandboxExecPlan {
         program: codex_sandboxing::seatbelt::MACOS_PATH_TO_SEATBELT_EXECUTABLE.to_string(),
         args: seatbelt_args,
